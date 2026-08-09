@@ -17,8 +17,9 @@ def validate_config(config: StrategyConfig) -> float:
     return native.validate_profitability(config.spreadBps, config.gmoFeeBps, config.expectedSlippageBps)
 
 
-def make_quotes(market: MarketTop, config: StrategyConfig) -> list[QuoteLevel]:
-    rows = native.make_quotes(market.bid, market.ask, market.bidSize, market.askSize, config.spreadBps, config.maxQuoteSize)
+def make_quotes(market: MarketTop, config: StrategyConfig, price_tick: float = 1) -> list[QuoteLevel]:
+    rows = native.make_quotes(market.bid, market.ask, market.bidSize, market.askSize, config.spreadBps,
+                              config.maxQuoteSize, price_tick)
     return [QuoteLevel(side=side, price=price, size=size, sourcePrice=source) for side, price, size, source in rows]
 
 

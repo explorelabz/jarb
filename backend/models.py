@@ -26,8 +26,8 @@ class StrategyConfig(BaseModel):
 
 class MarketTop(BaseModel):
     symbol: str
-    bid: int
-    ask: int
+    bid: float
+    ask: float
     bidSize: float
     askSize: float
     timestamp: str
@@ -36,9 +36,9 @@ class MarketTop(BaseModel):
 
 class QuoteLevel(BaseModel):
     side: Side
-    price: int
+    price: float
     size: float
-    sourcePrice: int
+    sourcePrice: float
 
 
 class ClientFill(BaseModel):
@@ -46,7 +46,7 @@ class ClientFill(BaseModel):
     orderId: str
     symbol: str
     side: Side
-    price: int
+    price: float
     size: float
     fee: float
     role: Literal["maker", "taker"]
@@ -59,7 +59,7 @@ class HedgeFill(BaseModel):
     clientFillId: str
     symbol: str
     side: Side
-    price: int
+    price: float
     size: float
     fee: float
     latencyMs: int
@@ -73,8 +73,8 @@ class MatchedTrade(BaseModel):
     symbol: str
     clientSide: Side
     size: float
-    clientPrice: int
-    hedgePrice: int
+    clientPrice: float
+    hedgePrice: float
     spreadPnl: float
     clientFee: float
     hedgeCost: float
@@ -116,8 +116,38 @@ class Metrics(BaseModel):
     coreCalcP99Us: float = 0
 
 
+class ConnectionState(BaseModel):
+    status: Literal["simulation", "connecting", "connected", "error"] = "simulation"
+    gmoConfigured: bool = False
+    gmoKeyHint: str | None = None
+    bittradeConfigured: bool = False
+    bittradeKeyHint: str | None = None
+    lastError: str | None = None
+
+
+class InstrumentRules(BaseModel):
+    symbol: str
+    baseAsset: str
+    quoteAsset: str = "JPY"
+    minOrderSize: float = Field(gt=0)
+    maxOrderSize: float = Field(gt=0)
+    sizeStep: float = Field(gt=0)
+    priceTick: float = Field(gt=0)
+
+
+class SymbolRuntime(BaseModel):
+    instrument: InstrumentRules
+    config: StrategyConfig
+    market: MarketTop
+    quotes: list[QuoteLevel]
+    position: float = 0
+    reconciliation: Reconciliation
+    pnl: Pnl = Field(default_factory=Pnl)
+    trades: list[MatchedTrade] = Field(default_factory=list)
+
+
 class SystemState(BaseModel):
-    mode: Literal["simulation", "live"]
+    mode: Literal["simulation", "online"]
     running: bool
     killSwitch: bool
     market: MarketTop
@@ -129,9 +159,14 @@ class SystemState(BaseModel):
     trades: list[MatchedTrade]
     events: list[AuditEvent]
     config: StrategyConfig
+    connection: ConnectionState = Field(default_factory=ConnectionState)
+    instrument: InstrumentRules
+    activeSymbols: list[str] = Field(default_factory=list)
+    symbolStates: dict[str, SymbolRuntime] = Field(default_factory=dict)
 
 
 class SimulatedFillRequest(BaseModel):
+    symbol: str | None = None
     side: Side
     size: float = Field(gt=0)
     role: Literal["maker", "taker"] = "maker"
@@ -139,3 +174,15 @@ class SimulatedFillRequest(BaseModel):
 
 class ControlRequest(BaseModel):
     action: Literal["pause", "resume", "kill", "reset-kill"]
+
+
+class ConnectionUpdate(BaseModel):
+    mode: Literal["simulation", "online"]
+    confirmOnline: bool = False
+    clearGmoCredentials: bool = False
+    clearBittradeCredentials: bool = False
+    gmoApiKey: str | None = Field(default=None, max_length=512)
+    gmoSecretKey: str | None = Field(default=None, max_length=512)
+    bittradeAccessKey: str | None = Field(default=None, max_length=512)
+    bittradeSecretKey: str | None = Field(default=None, max_length=512)
+    bittradeAccountId: str | None = Field(default=None, max_length=128)

@@ -22,14 +22,24 @@ class GmoAdapter:
         self.client = client or httpx.AsyncClient(timeout=3.0)
 
     async def ticker(self, symbol: str = "BTC") -> MarketTop:
-        response = await self.client.get(f"{self.PUBLIC}/ticker", params={"symbol": symbol})
+        response = await self.client.get(f"{self.PUBLIC}/orderbooks", params={"symbol": symbol})
         response.raise_for_status()
         payload = response.json()
-        if payload.get("status") != 0 or not payload.get("data"):
-            raise RuntimeError(f"GMO ticker failed: {payload.get('messages', payload)}")
-        item = payload["data"][0]
-        return MarketTop(symbol=f"{symbol}_JPY", bid=round(float(item["bid"])), ask=round(float(item["ask"])),
-                         bidSize=0.5, askSize=0.5, timestamp=item["timestamp"], source="GMO")
+        book = payload.get("data", {})
+        if payload.get("status") != 0 or not book.get("bids") or not book.get("asks"):
+            raise RuntimeError(f"GMO orderbook failed: {payload.get('messages', payload)}")
+        bid, ask = book["bids"][0], book["asks"][0]
+        return MarketTop(symbol=f"{symbol}_JPY", bid=float(bid["price"]), ask=float(ask["price"]),
+                         bidSize=float(bid["size"]), askSize=float(ask["size"]),
+                         timestamp=payload.get("responsetime", datetime.now(timezone.utc).isoformat()), source="GMO")
+
+    async def symbols(self) -> list[dict]:
+        response = await self.client.get(f"{self.PUBLIC}/symbols")
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("status") != 0 or not isinstance(payload.get("data"), list):
+            raise RuntimeError(f"GMO symbols failed: {payload.get('messages', payload)}")
+        return payload["data"]
 
     async def market_order(self, symbol: str, side: Side, size: float) -> dict:
         body = {"symbol": symbol.replace("_JPY", ""), "side": side, "executionType": "MARKET", "timeInForce": "FAK", "size": str(size)}
@@ -37,6 +47,13 @@ class GmoAdapter:
 
     async def executions(self, order_id: str) -> dict:
         return await self._private("GET", "/v1/executions", query={"orderId": order_id})
+
+    def set_credentials(self, api_key: str, secret_key: str) -> None:
+        self.api_key = api_key
+        self.secret_key = secret_key
+
+    async def verify_credentials(self) -> None:
+        await self._private("GET", "/v1/account/assets")
 
     async def _private(self, method: str, path: str, query: dict[str, str] | None = None, body: dict | None = None) -> dict:
         if not self.api_key or not self.secret_key:
@@ -74,6 +91,24 @@ class BitTradeAdapter:
 
     async def matches(self, order_id: str) -> dict:
         return await self._private("GET", f"/v1/order/orders/{order_id}/matchresults")
+
+    async def symbols(self) -> list[dict]:
+        response = await self.client.get(f"{self.BASE}/v1/common/symbols")
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("status") != "ok" or not isinstance(payload.get("data"), list):
+            raise RuntimeError(f"BitTrade symbols failed: {payload.get('err-msg', payload)}")
+        return payload["data"]
+
+    def set_credentials(self, access_key: str, secret_key: str, account_id: str) -> None:
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.account_id = account_id
+
+    async def verify_credentials(self) -> None:
+        if not self.access_key or not self.secret_key:
+            raise RuntimeError("BitTrade credentials are not configured")
+        await self._private("GET", "/v1/account/accounts")
 
     async def _private(self, method: str, path: str, query: dict[str, str] | None = None, body: dict | None = None) -> dict:
         if not self.access_key or not self.secret_key or not self.account_id:

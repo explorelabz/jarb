@@ -1,7 +1,28 @@
 export type Side = 'BUY' | 'SELL'
 
+export interface InstrumentRules {
+  symbol: string
+  baseAsset: string
+  quoteAsset: string
+  minOrderSize: number
+  maxOrderSize: number
+  sizeStep: number
+  priceTick: number
+}
+
+export interface SymbolRuntime {
+  instrument: InstrumentRules
+  config: SystemState['config']
+  market: SystemState['market']
+  quotes: SystemState['quotes']
+  position: number
+  reconciliation: SystemState['reconciliation']
+  pnl: SystemState['pnl']
+  trades: SystemState['trades']
+}
+
 export interface SystemState {
-  mode: 'simulation' | 'live'
+  mode: 'simulation' | 'online'
   running: boolean
   killSwitch: boolean
   market: { symbol: string; bid: number; ask: number; bidSize: number; askSize: number; timestamp: string; source: string }
@@ -20,4 +41,13 @@ export interface SystemState {
     symbol: string; spreadBps: number; gmoFeeBps: number; expectedSlippageBps: number;
     maxQuoteSize: number; deltaLimit: number; maxHedgeLatencyMs: number; staleMarketMs: number
   }
+  connection: {
+    status: 'simulation' | 'connecting' | 'connected' | 'error'
+    gmoConfigured: boolean; gmoKeyHint: string | null
+    bittradeConfigured: boolean; bittradeKeyHint: string | null
+    lastError: string | null
+  }
+  instrument: InstrumentRules
+  activeSymbols: string[]
+  symbolStates: Record<string, SymbolRuntime>
 }

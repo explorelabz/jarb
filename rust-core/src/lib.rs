@@ -23,20 +23,23 @@ fn validate_profitability(spread_bps: f64, fee_bps: f64, slippage_bps: f64) -> P
 
 #[pyfunction]
 fn make_quotes(
-    bid: i64,
-    ask: i64,
+    bid: f64,
+    ask: f64,
     bid_size: f64,
     ask_size: f64,
     spread_bps: f64,
     max_quote_size: f64,
-) -> PyResult<Vec<(String, i64, f64, i64)>> {
-    if bid <= 0 || ask <= bid || max_quote_size <= 0.0 {
+    price_tick: f64,
+) -> PyResult<Vec<(String, f64, f64, f64)>> {
+    if bid <= 0.0 || ask <= bid || max_quote_size <= 0.0 || price_tick <= 0.0 {
         return Err(PyValueError::new_err("invalid market or quote size"));
     }
     let spread = spread_bps / 10_000.0;
+    let buy_price = ((bid * (1.0 - spread)) / price_tick).floor() * price_tick;
+    let sell_price = ((ask * (1.0 + spread)) / price_tick).ceil() * price_tick;
     Ok(vec![
-        ("BUY".into(), ((bid as f64) * (1.0 - spread)).round() as i64, bid_size.min(max_quote_size).max(0.0), bid),
-        ("SELL".into(), ((ask as f64) * (1.0 + spread)).round() as i64, ask_size.min(max_quote_size).max(0.0), ask),
+        ("BUY".into(), buy_price, bid_size.min(max_quote_size).max(0.0), bid),
+        ("SELL".into(), sell_price, ask_size.min(max_quote_size).max(0.0), ask),
     ])
 }
 
@@ -52,15 +55,15 @@ fn hedge_side(client_side: &str) -> PyResult<&'static str> {
 #[pyfunction]
 fn trade_pnl(
     client_side: &str,
-    client_price: i64,
-    hedge_price: i64,
+    client_price: f64,
+    hedge_price: f64,
     size: f64,
     client_fee: f64,
     hedge_fee: f64,
 ) -> PyResult<(f64, f64)> {
     let spread_pnl = match client_side {
-        "BUY" => ((hedge_price - client_price) as f64) * size,
-        "SELL" => ((client_price - hedge_price) as f64) * size,
+        "BUY" => (hedge_price - client_price) * size,
+        "SELL" => (client_price - hedge_price) * size,
         _ => return Err(PyValueError::new_err("side must be BUY or SELL")),
     };
     Ok((spread_pnl, spread_pnl + client_fee - hedge_fee))

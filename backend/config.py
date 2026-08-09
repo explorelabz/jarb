@@ -25,8 +25,7 @@ strategy_config = StrategyConfig(
     quoteRefreshMs=int(number("QUOTE_REFRESH_MS", 1000)),
 )
 
-requested_mode = "live" if os.getenv("TRADING_MODE") == "live" else "simulation"
-live_armed = os.getenv("LIVE_TRADING") == "true" and os.getenv("ARM_LIVE_TRADING") == "I_UNDERSTAND"
+requested_mode = "online" if os.getenv("TRADING_MODE") in {"online", "live"} else "simulation"
 
 
 @dataclass(frozen=True)

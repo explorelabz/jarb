@@ -19,6 +19,13 @@ def test_quotes_are_outside_gmo_and_depth_capped():
     assert quotes[1].size == .05
 
 
+def test_quotes_follow_decimal_price_tick():
+    market = MarketTop(symbol="DOGE_JPY", bid=24.123, ask=24.127, bidSize=100, askSize=100, timestamp="", source="GMO")
+    quotes = make_quotes(market, config(maxQuoteSize=10), price_tick=.001)
+    assert quotes[0].price == 24.098
+    assert quotes[1].price == 24.152
+
+
 def test_hedge_direction_is_opposite():
     assert opposite_side("BUY") == "SELL"
     assert opposite_side("SELL") == "BUY"
