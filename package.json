@@ -1,0 +1,34 @@
+{
+  "name": "bittrade-gmo-market-maker",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": ".venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8787",
+    "dev:web": "vite",
+    "build": "tsc -b && vite build",
+    "start": ".venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8787",
+    "test": ".venv/bin/python -m pytest -q",
+    "bench": ".venv/bin/python benchmarks/core_bench.py",
+    "rust:build": "bash scripts/build_rust.sh"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "concurrently": "^9.2.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.1"
+  }
+}

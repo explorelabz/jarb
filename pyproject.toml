@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "bittrade-gmo-market-maker"
+version = "0.2.0"
+description = "Python trading orchestration with a Rust hot-path core"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[dependency-groups]
+dev = [
+  "maturin>=1.9,<2",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+
+[tool.uv]
+package = false
+
+[tool.maturin]
+manifest-path = "rust-core/Cargo.toml"
+module-name = "hedge_core"
