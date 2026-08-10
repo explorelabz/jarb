@@ -9,10 +9,28 @@ Side = Literal["BUY", "SELL"]
 
 GMO_TAKER_BPS: dict[str, float] = {"BTC": 5.0, "ETH": 5.0, "XRP": 5.0, "DAI": 5.0}
 GMO_TAKER_BPS_DEFAULT = 9.0
+GMO_MAKER_BPS: dict[str, float] = {"BTC": -1.0, "ETH": -1.0, "XRP": -1.0, "DAI": -1.0}
+GMO_MAKER_BPS_DEFAULT = -3.0
 
 
-def gmo_taker_bps(base_asset: str) -> float:
-    return GMO_TAKER_BPS.get(base_asset.upper(), GMO_TAKER_BPS_DEFAULT)
+def gmo_taker_bps(base_asset: str, overrides: dict[str, float] | None = None) -> float:
+    asset = base_asset.upper()
+    if overrides and asset in overrides:
+        return float(overrides[asset])
+    return GMO_TAKER_BPS.get(asset, GMO_TAKER_BPS_DEFAULT)
+
+
+def gmo_maker_bps(base_asset: str, overrides: dict[str, float] | None = None) -> float:
+    asset = base_asset.upper()
+    if overrides and asset in overrides:
+        return float(overrides[asset])
+    return GMO_MAKER_BPS.get(asset, GMO_MAKER_BPS_DEFAULT)
+
+
+def expected_gmo_fee_bps(config: "StrategyConfig") -> float:
+    """Expected blended GMO fee for SOK maker fills plus FAK fallback fills."""
+    passive = min(1.0, max(0.0, config.expectedPassiveFillRatio))
+    return config.gmoMakerFeeBps * passive + config.gmoFeeBps * (1.0 - passive)
 
 
 def utc_now() -> str:
@@ -24,10 +42,15 @@ class StrategyConfig(BaseModel):
     spreadBps: float = Field(25, gt=0)
     bittradeMakerFeeBps: float = Field(0, ge=-100, le=100)
     gmoFeeBps: float = Field(5, ge=0)
-    expectedSlippageBps: float = Field(1.5, ge=0)
+    gmoMakerFeeBps: float = Field(-1, ge=-100, le=100)
+    expectedPassiveFillRatio: float = Field(.8, ge=0, le=1)
+    gmoPostOnlyTimeoutMs: int = Field(800, ge=100, le=10_000)
+    maxHedgeSlippageBps: float = Field(3, ge=0, le=100)
+    expectedSlippageBps: float = Field(3, ge=0)
+    queueBudget: float = Field(.05, ge=0)
     maxQuoteSize: float = Field(0.05, gt=0)
     deltaLimit: float = Field(0.005, gt=0)
-    maxHedgeLatencyMs: int = Field(1000, gt=0)
+    maxHedgeLatencyMs: int = Field(2500, gt=0)
     staleMarketMs: int = Field(800, gt=0)
     quoteRefreshMs: int = Field(1000, ge=100)
 
@@ -38,6 +61,8 @@ class MarketTop(BaseModel):
     ask: float
     bidSize: float
     askSize: float
+    bids: list[tuple[float, float]] = Field(default_factory=list)
+    asks: list[tuple[float, float]] = Field(default_factory=list)
     timestamp: str
     source: Literal["GMO", "SIM"]
 
@@ -125,12 +150,27 @@ class Metrics(BaseModel):
 
 
 class ConnectionState(BaseModel):
-    status: Literal["simulation", "connecting", "connected", "error"] = "simulation"
+    status: Literal["paper", "connecting", "connected", "error"] = "paper"
     gmoConfigured: bool = False
     gmoKeyHint: str | None = None
     bittradeConfigured: bool = False
     bittradeKeyHint: str | None = None
     lastError: str | None = None
+
+
+class AssetHolding(BaseModel):
+    configured: float = 0
+    opening: float | None = None
+    available: float | None = None
+    reserved: float = 0
+    change: float | None = None
+
+
+class HoldingsState(BaseModel):
+    source: Literal["paper", "exchange", "configured"] = "configured"
+    updatedAt: str | None = None
+    bittrade: dict[str, AssetHolding] = Field(default_factory=dict)
+    gmo: dict[str, AssetHolding] = Field(default_factory=dict)
 
 
 class InstrumentRules(BaseModel):
@@ -157,7 +197,7 @@ class SymbolRuntime(BaseModel):
 
 
 class SystemState(BaseModel):
-    mode: Literal["simulation", "online"]
+    mode: Literal["paper", "live"]
     running: bool
     killSwitch: bool
     market: MarketTop
@@ -174,9 +214,10 @@ class SystemState(BaseModel):
     activeSymbols: list[str] = Field(default_factory=list)
     symbolStates: dict[str, SymbolRuntime] = Field(default_factory=dict)
     disabledSymbols: dict[str, list[str]] = Field(default_factory=dict)
+    holdings: HoldingsState = Field(default_factory=HoldingsState)
 
 
-class SimulatedFillRequest(BaseModel):
+class PaperFillRequest(BaseModel):
     symbol: str | None = None
     side: Side
     size: float = Field(gt=0)
@@ -192,6 +233,16 @@ class ArmRequest(BaseModel):
     actor: str = Field(default="operator", min_length=1, max_length=128)
 
 
+class RiskLimitsUpdate(BaseModel):
+    maxSingleOrderJpy: float | None = Field(default=None, gt=0)
+    maxDailyVolumeJpy: float | None = Field(default=None, gt=0)
+    maxDailyLossJpy: float | None = Field(default=None, gt=0)
+    maxAbsDelta: float | None = Field(default=None, gt=0)
+    maxHedgeFailures: int | None = Field(default=None, gt=0)
+    maxHedgeP95Ms: int | None = Field(default=None, gt=0)
+    armTtlSec: int | None = Field(default=None, gt=0)
+
+
 class InventoryUpdate(BaseModel):
     bittrade: dict[str, float] = Field(default_factory=dict)
     gmo: dict[str, float] = Field(default_factory=dict)
@@ -200,7 +251,7 @@ class InventoryUpdate(BaseModel):
 
 
 class ConnectionUpdate(BaseModel):
-    mode: Literal["simulation", "online"]
+    mode: Literal["paper", "live"]
     confirmOnline: bool = False
     clearGmoCredentials: bool = False
     clearBittradeCredentials: bool = False
@@ -209,3 +260,35 @@ class ConnectionUpdate(BaseModel):
     bittradeAccessKey: str | None = Field(default=None, max_length=512)
     bittradeSecretKey: str | None = Field(default=None, max_length=512)
     bittradeAccountId: str | None = Field(default=None, max_length=128)
+
+
+class PaperScenarioUpdate(BaseModel):
+    autoMatch: bool | None = None
+    partialFills: bool | None = None
+    dustFills: bool | None = None
+    duplicateEvents: bool | None = None
+    outOfOrderEvents: bool | None = None
+    cancelAlreadyFilled: bool | None = None
+    cancelRaceFill: bool | None = None
+    gmoPartialFak: bool | None = None
+    gmoPostOnlyFillRatio: float | None = Field(default=None, ge=0, le=1)
+    gmoPostOnlyFillDelayMs: int | None = Field(default=None, ge=0, le=10_000)
+    delayedExecutions: bool | None = None
+    postOnlyReject: bool | None = None
+    randomRateLimit: bool | None = None
+    randomNetworkTimeout: bool | None = None
+    autoMatchProbability: float | None = Field(default=None, ge=0, le=1)
+    dustProbability: float | None = Field(default=None, ge=0, le=1)
+    duplicateProbability: float | None = Field(default=None, ge=0, le=1)
+    outOfOrderProbability: float | None = Field(default=None, ge=0, le=1)
+    cancelRaceProbability: float | None = Field(default=None, ge=0, le=1)
+    gmoFillRatio: float | None = Field(default=None, gt=0, le=1)
+    executionDelayMinMs: int | None = Field(default=None, ge=0, le=10_000)
+    executionDelayMaxMs: int | None = Field(default=None, ge=0, le=10_000)
+    rateLimitProbability: float | None = Field(default=None, ge=0, le=1)
+    networkTimeoutProbability: float | None = Field(default=None, ge=0, le=1)
+    seed: int | None = None
+
+
+# Kept as an import alias for older API clients and tests.
+SimulatedFillRequest = PaperFillRequest

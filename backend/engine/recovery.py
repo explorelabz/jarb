@@ -59,7 +59,7 @@ class RecoveryCoordinator:
                 )
                 return
             await self.gateway.cancel_all()
-        if self.reconcile_fills is not None and reconciliation_orders:
+        if self.reconcile_fills is not None:
             try:
                 await self.reconcile_fills(reconciliation_orders)
             except Exception as exc:
@@ -75,5 +75,4 @@ class RecoveryCoordinator:
         if await self.store.escalated_hedges():
             await self.store.audit("recovery.hedge.escalated", "critical", "manual hedge resolution required")
             return
-        await self.store.set_state("last_processed_ts", await self.store.get_state("last_processed_ts", None))
         await self.risk.mark_recovery_complete()

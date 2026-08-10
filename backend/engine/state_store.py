@@ -22,6 +22,7 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS orders (
     client_order_id TEXT PRIMARY KEY,
     exchange_order_id TEXT,
+    trading_mode TEXT NOT NULL DEFAULT 'live' CHECK(trading_mode IN ('paper','live','legacy_simulation')),
     symbol TEXT NOT NULL,
     side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
     qty TEXT NOT NULL,
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS hedge_intents (
     qty TEXT NOT NULL,
     filled_qty TEXT NOT NULL DEFAULT '0',
     filled_notional TEXT NOT NULL DEFAULT '0',
+    fee_jpy TEXT NOT NULL DEFAULT '0',
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     latency_ms INTEGER NOT NULL DEFAULT 0,
@@ -100,8 +102,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
 class StateStore:
     """SQLite WAL store. Every state transition and fill delta is committed before side effects."""
 
-    def __init__(self, path: Path | str = Path("data/jarb.db")):
+    def __init__(self, path: Path | str = Path("data/jarb.db"), *, trading_mode: str = "live"):
         self.path = Path(path)
+        self.trading_mode = self._normalize_mode(trading_mode)
         self._connection: sqlite3.Connection | None = None
         self._lock = threading.RLock()
 
@@ -115,12 +118,17 @@ class StateStore:
                 self._connection = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
                 self._connection.row_factory = sqlite3.Row
                 self._connection.executescript(SCHEMA)
+                self._migrate_trading_modes_sync()
                 columns = {
                     row["name"] for row in self._connection.execute("PRAGMA table_info(hedge_intents)")
                 }
                 if "filled_notional" not in columns:
                     self._connection.execute(
                         "ALTER TABLE hedge_intents ADD COLUMN filled_notional TEXT NOT NULL DEFAULT '0'"
+                    )
+                if "fee_jpy" not in columns:
+                    self._connection.execute(
+                        "ALTER TABLE hedge_intents ADD COLUMN fee_jpy TEXT NOT NULL DEFAULT '0'"
                     )
                 if "latency_ms" not in columns:
                     self._connection.execute(
@@ -133,6 +141,58 @@ class StateStore:
                     self._connection.execute(
                         "UPDATE hedge_intents SET source_fill_at=created_at WHERE source_fill_at IS NULL"
                     )
+                order_columns = {
+                    row["name"] for row in self._connection.execute("PRAGMA table_info(orders)")
+                }
+                if "trading_mode" not in order_columns:
+                    self._connection.execute(
+                        "ALTER TABLE orders ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'live'"
+                    )
+
+    def _migrate_trading_modes_sync(self) -> None:
+        db = self._db()
+        row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'"
+        ).fetchone()
+        sql = str(row["sql"] or "") if row else ""
+        if "'paper'" in sql and "'live'" in sql and "'legacy_simulation'" in sql:
+            return
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute("""
+                CREATE TABLE orders_v2 (
+                    client_order_id TEXT PRIMARY KEY,
+                    exchange_order_id TEXT,
+                    trading_mode TEXT NOT NULL DEFAULT 'live' CHECK(trading_mode IN ('paper','live','legacy_simulation')),
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+                    qty TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    cumulative_filled TEXT NOT NULL DEFAULT '0',
+                    last_error TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            db.execute(
+                "INSERT INTO orders_v2 SELECT client_order_id,exchange_order_id,"
+                "CASE WHEN trading_mode='simulation' THEN 'legacy_simulation' "
+                "WHEN trading_mode='online' THEN 'live' "
+                "WHEN trading_mode='paper' AND client_order_id LIKE 'BT-%' THEN 'legacy_simulation' "
+                "ELSE trading_mode END,symbol,side,qty,price,state,cumulative_filled,last_error,"
+                "created_at,updated_at FROM orders"
+            )
+            db.execute("DROP TABLE orders")
+            db.execute("ALTER TABLE orders_v2 RENAME TO orders")
+            db.execute("CREATE INDEX orders_state_idx ON orders(state, symbol)")
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+        finally:
+            db.execute("PRAGMA foreign_keys=ON")
 
     async def close(self) -> None:
         await asyncio.to_thread(self._close_sync)
@@ -148,15 +208,23 @@ class StateStore:
             raise RuntimeError("StateStore is not initialized")
         return self._connection
 
-    async def create_order(self, client_order_id: str, symbol: str, side: str, qty: Decimal, price: Decimal) -> dict:
-        return await asyncio.to_thread(self._create_order_sync, client_order_id, symbol, side, qty, price)
+    async def create_order(self, client_order_id: str, symbol: str, side: str, qty: Decimal,
+                           price: Decimal, *, trading_mode: str | None = None) -> dict:
+        return await asyncio.to_thread(
+            self._create_order_sync, client_order_id, symbol, side, qty, price,
+            self.trading_mode if trading_mode is None else trading_mode,
+        )
 
-    def _create_order_sync(self, client_order_id: str, symbol: str, side: str, qty: Decimal, price: Decimal) -> dict:
+    def _create_order_sync(self, client_order_id: str, symbol: str, side: str, qty: Decimal,
+                           price: Decimal, trading_mode: str) -> dict:
+        trading_mode = self._normalize_mode(trading_mode)
+        if trading_mode not in {"paper", "live", "legacy_simulation"}:
+            raise ValueError(f"unsupported trading mode: {trading_mode}")
         with self._lock:
             db = self._db()
             db.execute(
-                "INSERT OR IGNORE INTO orders(client_order_id,symbol,side,qty,price,state) VALUES(?,?,?,?,?,?)",
-                (client_order_id, symbol, side, str(qty), str(price), OrderState.NEW),
+                "INSERT OR IGNORE INTO orders(client_order_id,symbol,side,qty,price,state,trading_mode) VALUES(?,?,?,?,?,?,?)",
+                (client_order_id, symbol, side, str(qty), str(price), OrderState.NEW, trading_mode),
             )
             return dict(db.execute("SELECT * FROM orders WHERE client_order_id=?", (client_order_id,)).fetchone())
 
@@ -202,7 +270,7 @@ class StateStore:
                     db.execute("COMMIT")
                     return None
                 order = db.execute(
-                    "SELECT cumulative_filled,qty FROM orders WHERE client_order_id=?", (client_order_id,),
+                    "SELECT cumulative_filled,qty,state FROM orders WHERE client_order_id=?", (client_order_id,),
                 ).fetchone()
                 if order is None:
                     raise KeyError(client_order_id)
@@ -215,7 +283,17 @@ class StateStore:
                 )
                 new_cumulative = max(recorded, cumulative_qty)
                 total = Decimal(order["qty"])
-                next_state = OrderState.FILLED if new_cumulative >= total else OrderState.PARTIAL
+                current_state = OrderState(order["state"])
+                if current_state in (OrderState.CANCELED, OrderState.FILLED):
+                    next_state = current_state
+                elif new_cumulative >= total:
+                    next_state = OrderState.FILLED
+                elif current_state == OrderState.CANCELING:
+                    next_state = current_state
+                else:
+                    next_state = OrderState.PARTIAL
+                if next_state != current_state and next_state not in ORDER_TRANSITIONS[current_state]:
+                    raise ValueError(f"invalid order transition {current_state} -> {next_state}")
                 db.execute(
                     "UPDATE orders SET cumulative_filled=?,state=?,updated_at=CURRENT_TIMESTAMP WHERE client_order_id=?",
                     (str(new_cumulative), next_state, client_order_id),
@@ -247,15 +325,17 @@ class StateStore:
 
     async def transition_hedge(self, intent_id: str, target: HedgeStatus, *, filled_qty: Decimal | None = None,
                                filled_notional: Decimal | None = None,
+                               fee_jpy: Decimal | None = None,
                                latency_ms: int | None = None,
                                exchange_order_id: str | None = None, error: str | None = None) -> HedgeIntent:
         return await asyncio.to_thread(
-            self._transition_hedge_sync, intent_id, target, filled_qty, filled_notional,
+            self._transition_hedge_sync, intent_id, target, filled_qty, filled_notional, fee_jpy,
             latency_ms, exchange_order_id, error,
         )
 
     def _transition_hedge_sync(self, intent_id: str, target: HedgeStatus, filled_qty: Decimal | None,
-                               filled_notional: Decimal | None, latency_ms: int | None,
+                               filled_notional: Decimal | None, fee_jpy: Decimal | None,
+                               latency_ms: int | None,
                                exchange_order_id: str | None, error: str | None) -> HedgeIntent:
         with self._lock:
             db = self._db()
@@ -267,9 +347,10 @@ class StateStore:
                 raise ValueError(f"invalid hedge transition {current} -> {target}")
             attempts = row["attempts"] + (1 if target == HedgeStatus.HEDGING and target != current else 0)
             db.execute(
-                "UPDATE hedge_intents SET status=?,filled_qty=COALESCE(?,filled_qty),filled_notional=COALESCE(?,filled_notional),latency_ms=COALESCE(?,latency_ms),exchange_order_id=COALESCE(?,exchange_order_id),attempts=?,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                "UPDATE hedge_intents SET status=?,filled_qty=COALESCE(?,filled_qty),filled_notional=COALESCE(?,filled_notional),fee_jpy=COALESCE(?,fee_jpy),latency_ms=COALESCE(?,latency_ms),exchange_order_id=COALESCE(?,exchange_order_id),attempts=?,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (target, str(filled_qty) if filled_qty is not None else None,
                  str(filled_notional) if filled_notional is not None else None,
+                 str(fee_jpy) if fee_jpy is not None else None,
                  latency_ms, exchange_order_id, attempts, error, intent_id),
             )
             return self._intent(db.execute("SELECT * FROM hedge_intents WHERE id=?", (intent_id,)).fetchone())
@@ -280,8 +361,10 @@ class StateStore:
     def _pending_hedges_sync(self) -> list[HedgeIntent]:
         with self._lock:
             rows = self._db().execute(
-                "SELECT * FROM hedge_intents WHERE status IN (?,?,?) ORDER BY created_at,id",
-                (HedgeStatus.PENDING, HedgeStatus.RETRY, HedgeStatus.HEDGING),
+                "SELECT h.* FROM hedge_intents h JOIN fills f ON f.id=h.client_fill_id "
+                "JOIN orders o ON o.client_order_id=f.client_order_id "
+                "WHERE o.trading_mode=? AND h.status IN (?,?,?) ORDER BY h.created_at,h.id",
+                (self.trading_mode, HedgeStatus.PENDING, HedgeStatus.RETRY, HedgeStatus.HEDGING),
             ).fetchall()
             return [self._intent(row) for row in rows]
 
@@ -291,8 +374,10 @@ class StateStore:
     def _pending_hedge_exposure_sync(self) -> dict[str, Decimal]:
         with self._lock:
             rows = self._db().execute(
-                "SELECT symbol,side,qty,filled_qty FROM hedge_intents WHERE status IN (?,?,?)",
-                (HedgeStatus.PENDING, HedgeStatus.RETRY, HedgeStatus.HEDGING),
+                "SELECT h.symbol,h.side,h.qty,h.filled_qty FROM hedge_intents h "
+                "JOIN fills f ON f.id=h.client_fill_id JOIN orders o ON o.client_order_id=f.client_order_id "
+                "WHERE o.trading_mode=? AND h.status IN (?,?,?)",
+                (self.trading_mode, HedgeStatus.PENDING, HedgeStatus.RETRY, HedgeStatus.HEDGING),
             ).fetchall()
         result: dict[str, Decimal] = {}
         for row in rows:
@@ -308,8 +393,10 @@ class StateStore:
     def _escalated_hedges_sync(self) -> list[HedgeIntent]:
         with self._lock:
             rows = self._db().execute(
-                "SELECT * FROM hedge_intents WHERE status=? ORDER BY created_at,id",
-                (HedgeStatus.ESCALATE,),
+                "SELECT h.* FROM hedge_intents h JOIN fills f ON f.id=h.client_fill_id "
+                "JOIN orders o ON o.client_order_id=f.client_order_id "
+                "WHERE o.trading_mode=? AND h.status=? ORDER BY h.created_at,h.id",
+                (self.trading_mode, HedgeStatus.ESCALATE),
             ).fetchall()
         return [self._intent(row) for row in rows]
 
@@ -319,8 +406,10 @@ class StateStore:
     def _hedge_health_sync(self, day_prefix: str) -> tuple[int, int]:
         with self._lock:
             rows = self._db().execute(
-                "SELECT status,latency_ms FROM hedge_intents WHERE created_at LIKE ?",
-                (f"{day_prefix}%",),
+                "SELECT h.status,h.latency_ms FROM hedge_intents h "
+                "JOIN fills f ON f.id=h.client_fill_id JOIN orders o ON o.client_order_id=f.client_order_id "
+                "WHERE o.trading_mode=? AND h.created_at LIKE ?",
+                (self.trading_mode, f"{day_prefix}%"),
             ).fetchall()
         failures = sum(1 for row in rows if row["status"] in (HedgeStatus.RETRY, HedgeStatus.ESCALATE))
         latencies = sorted(row["latency_ms"] for row in rows if row["latency_ms"] > 0)
@@ -333,8 +422,10 @@ class StateStore:
     def _daily_fill_volume_sync(self, day_prefix: str) -> Decimal:
         with self._lock:
             rows = self._db().execute(
-                "SELECT incremental_qty,price FROM fills WHERE occurred_at LIKE ?",
-                (f"{day_prefix}%",),
+                "SELECT f.incremental_qty,f.price FROM fills f "
+                "JOIN orders o ON o.client_order_id=f.client_order_id "
+                "WHERE o.trading_mode=? AND f.occurred_at LIKE ?",
+                (self.trading_mode, f"{day_prefix}%"),
             ).fetchall()
         return sum((Decimal(row["incremental_qty"]) * Decimal(row["price"]) for row in rows), Decimal("0"))
 
@@ -348,10 +439,11 @@ class StateStore:
                                  hedge_fee_bps: Decimal | dict[str, Decimal]) -> Decimal:
         with self._lock:
             rows = self._db().execute(
-                "SELECT f.symbol,f.side,f.incremental_qty,f.price,h.filled_qty,h.filled_notional "
-                "FROM fills f JOIN hedge_intents h ON h.client_fill_id=f.id "
-                "WHERE f.occurred_at LIKE ? AND h.filled_qty > '0'",
-                (f"{day_prefix}%",),
+                "SELECT f.symbol,f.side,f.incremental_qty,f.price,h.filled_qty,h.filled_notional,h.fee_jpy "
+                "FROM fills f JOIN orders o ON o.client_order_id=f.client_order_id "
+                "JOIN hedge_intents h ON h.client_fill_id=f.id "
+                "WHERE o.trading_mode=? AND f.occurred_at LIKE ? AND h.filled_qty > '0'",
+                (self.trading_mode, f"{day_prefix}%"),
             ).fetchall()
         pnl = Decimal("0")
         for row in rows:
@@ -362,10 +454,13 @@ class StateStore:
             client_notional = Decimal(row["price"]) * hedged_qty
             hedge_notional = Decimal(row["filled_notional"])
             spread = hedge_notional - client_notional if row["side"] == "BUY" else client_notional - hedge_notional
+            stored_fee = Decimal(row["fee_jpy"] or "0")
             symbol_hedge_fee = hedge_fee_bps.get(row["symbol"], Decimal("9")) \
                 if isinstance(hedge_fee_bps, dict) else hedge_fee_bps
+            hedge_fee = stored_fee if stored_fee != 0 else \
+                hedge_notional * symbol_hedge_fee / Decimal("10000")
             pnl += spread - client_notional * maker_fee_bps / Decimal("10000") \
-                - hedge_notional * symbol_hedge_fee / Decimal("10000")
+                - hedge_fee
         return pnl
 
     async def open_orders(self) -> list[dict]:
@@ -375,7 +470,72 @@ class StateStore:
         states = (OrderState.PLACING, OrderState.OPEN, OrderState.PARTIAL, OrderState.CANCELING, OrderState.UNKNOWN)
         with self._lock:
             marks = ",".join("?" for _ in states)
-            return [dict(row) for row in self._db().execute(f"SELECT * FROM orders WHERE state IN ({marks})", states).fetchall()]
+            return [dict(row) for row in self._db().execute(
+                f"SELECT * FROM orders WHERE trading_mode=? AND state IN ({marks})",
+                (self.trading_mode, *states),
+            ).fetchall()]
+
+    async def order(self, client_order_id: str) -> dict | None:
+        return await asyncio.to_thread(self._order_sync, client_order_id)
+
+    def _order_sync(self, client_order_id: str) -> dict | None:
+        with self._lock:
+            row = self._db().execute(
+                "SELECT * FROM orders WHERE client_order_id=?", (client_order_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    async def trading_projection(self, symbol: str | None = None,
+                                 trading_mode: str | None = None) -> list[dict]:
+        return await asyncio.to_thread(self._trading_projection_sync, symbol, trading_mode)
+
+    def _trading_projection_sync(self, symbol: str | None, trading_mode: str | None) -> list[dict]:
+        query = (
+            "SELECT f.id AS fill_id,f.client_order_id,f.order_id,f.trade_id,f.symbol,f.side,"
+            "f.incremental_qty,f.price,f.fee,f.occurred_at,"
+            "h.id AS hedge_id,h.side AS hedge_side,h.filled_qty,h.filled_notional,h.fee_jpy,"
+            "h.latency_ms,h.exchange_order_id AS hedge_order_id,h.status AS hedge_status "
+            "FROM fills f JOIN orders o ON o.client_order_id=f.client_order_id "
+            "LEFT JOIN hedge_intents h ON h.client_fill_id=f.id"
+        )
+        clauses: list[str] = []
+        params: list[str] = []
+        if symbol is not None:
+            clauses.append("f.symbol=?")
+            params.append(symbol)
+        if trading_mode is not None:
+            clauses.append("o.trading_mode=?")
+            params.append(trading_mode)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY f.occurred_at,f.id"
+        with self._lock:
+            return [dict(row) for row in self._db().execute(query, tuple(params)).fetchall()]
+
+    async def export_order_rows(self, trading_mode: str | None = None) -> list[dict]:
+        return await asyncio.to_thread(self._export_order_rows_sync, trading_mode)
+
+    def _export_order_rows_sync(self, trading_mode: str | None) -> list[dict]:
+        query = (
+            "SELECT o.trading_mode,o.client_order_id,o.exchange_order_id,o.symbol,o.side,"
+            "o.qty AS order_qty,o.price AS order_price,o.state,o.cumulative_filled,o.last_error,"
+            "o.created_at AS order_created_at,o.updated_at AS order_updated_at,"
+            "f.id AS fill_id,f.trade_id,f.incremental_qty AS fill_qty,f.price AS fill_price,"
+            "f.fee AS fill_fee,f.occurred_at AS fill_occurred_at,"
+            "h.id AS hedge_intent_id,h.side AS hedge_side,h.qty AS hedge_requested_qty,"
+            "h.filled_qty AS hedge_filled_qty,h.filled_notional AS hedge_filled_notional,h.fee_jpy AS hedge_fee_jpy,"
+            "h.status AS hedge_status,h.attempts AS hedge_attempts,h.latency_ms AS hedge_latency_ms,"
+            "h.exchange_order_id AS hedge_exchange_order_id,h.last_error AS hedge_last_error "
+            "FROM orders o LEFT JOIN fills f ON f.client_order_id=o.client_order_id "
+            "LEFT JOIN hedge_intents h ON h.client_fill_id=f.id"
+        )
+        params: tuple[str, ...] = ()
+        if trading_mode is not None:
+            query += " WHERE o.trading_mode=?"
+            params = (trading_mode,)
+        query += " ORDER BY o.created_at,o.client_order_id,f.id"
+        with self._lock:
+            return [dict(row) for row in self._db().execute(query, params).fetchall()]
 
     async def orders_for_fill_reconciliation(self, limit: int = 1000) -> list[dict]:
         return await asyncio.to_thread(self._orders_for_fill_reconciliation_sync, limit)
@@ -383,9 +543,9 @@ class StateStore:
     def _orders_for_fill_reconciliation_sync(self, limit: int) -> list[dict]:
         with self._lock:
             rows = self._db().execute(
-                "SELECT * FROM orders WHERE exchange_order_id IS NOT NULL AND state NOT IN (?,?) "
+                "SELECT * FROM orders WHERE trading_mode=? AND exchange_order_id IS NOT NULL AND state NOT IN (?,?) "
                 "ORDER BY updated_at DESC LIMIT ?",
-                (OrderState.NEW, OrderState.FAILED, limit),
+                (self.trading_mode, OrderState.NEW, OrderState.FAILED, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -455,11 +615,16 @@ class StateStore:
             )
 
     @staticmethod
+    def _normalize_mode(value: str) -> str:
+        return {"simulation": "paper", "online": "live"}.get(value, value)
+
+    @staticmethod
     def _intent(row: sqlite3.Row) -> HedgeIntent:
         return HedgeIntent(
             id=row["id"], client_fill_id=row["client_fill_id"], symbol=row["symbol"], side=row["side"],
             qty=Decimal(row["qty"]), filled_qty=Decimal(row["filled_qty"]),
-            filled_notional=Decimal(row["filled_notional"]), status=HedgeStatus(row["status"]),
+            filled_notional=Decimal(row["filled_notional"]), fee_jpy=Decimal(row["fee_jpy"]),
+            status=HedgeStatus(row["status"]),
             attempts=row["attempts"], latency_ms=row["latency_ms"], created_at=row["created_at"],
             source_fill_at=row["source_fill_at"] or row["created_at"],
             exchange_order_id=row["exchange_order_id"],

@@ -7,21 +7,36 @@ try:
 except ImportError as exc:  # pragma: no cover - startup guard
     raise RuntimeError("Rust 核心未安装，请运行 npm run rust:build") from exc
 
-from .models import ClientFill, HedgeFill, MarketTop, MatchedTrade, QuoteLevel, Reconciliation, StrategyConfig, utc_now
+from .models import (
+    ClientFill, HedgeFill, MarketTop, MatchedTrade, QuoteLevel, Reconciliation,
+    StrategyConfig, expected_gmo_fee_bps, utc_now,
+)
 
 if TYPE_CHECKING:
     from typing import Literal
 
 
 def validate_config(config: StrategyConfig) -> float:
+    minimum_latency_limit = config.gmoPostOnlyTimeoutMs + 1200
+    if config.maxHedgeLatencyMs < minimum_latency_limit:
+        raise ValueError(
+            f"maxHedgeLatencyMs 必须至少为 {minimum_latency_limit}ms "
+            "（SOK 等待时间 + 撤单/FAK 确认余量）"
+        )
     return native.validate_profitability(
-        config.spreadBps, config.gmoFeeBps + config.bittradeMakerFeeBps, config.expectedSlippageBps
+        config.spreadBps,
+        expected_gmo_fee_bps(config) + config.bittradeMakerFeeBps,
+        max(config.expectedSlippageBps, config.maxHedgeSlippageBps),
     )
 
 
 def make_quotes(market: MarketTop, config: StrategyConfig, price_tick: float = 1) -> list[QuoteLevel]:
-    rows = native.make_quotes(market.bid, market.ask, market.bidSize, market.askSize, config.spreadBps,
-                              config.maxQuoteSize, price_tick)
+    bids = market.bids or [(market.bid, market.bidSize)]
+    asks = market.asks or [(market.ask, market.askSize)]
+    rows = native.make_quotes(
+        market.bid, market.ask, bids, asks, config.spreadBps,
+        config.maxQuoteSize, price_tick, config.maxHedgeSlippageBps,
+    )
     return [QuoteLevel(side=side, price=price, size=size, sourcePrice=source) for side, price, size, source in rows]
 
 

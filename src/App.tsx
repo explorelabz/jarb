@@ -3,7 +3,7 @@ import {
   Pulse, ArrowClockwise, ArrowsLeftRight, CheckCircle, DownloadSimple, Gauge,
   Lightning, Pause, Play, ShieldCheck, Siren, SlidersHorizontal, Warning,
 } from '@phosphor-icons/react'
-import type { InstrumentRules, InventoryState, RiskStatus, Side, SystemState } from './types'
+import type { InstrumentRules, InventoryState, PaperScenarios, RiskLimits, RiskStatus, Side, SystemState } from './types'
 
 const jpy = new Intl.NumberFormat('ja-JP', { maximumFractionDigits: 0 })
 const decimal = new Intl.NumberFormat('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 8 })
@@ -17,6 +17,8 @@ const stepPrecision = (step: number) => {
 const price = (value: number, tick: number) => new Intl.NumberFormat('ja-JP', {
   minimumFractionDigits: stepPrecision(tick), maximumFractionDigits: stepPrecision(tick),
 }).format(value)
+const blendedGmoFee = (config: SystemState['config']) => config.gmoMakerFeeBps * config.expectedPassiveFillRatio
+  + config.gmoFeeBps * (1 - config.expectedPassiveFillRatio)
 
 async function api(path: string, init?: RequestInit) {
   const response = await fetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } })
@@ -46,7 +48,7 @@ function MarketLadder({ state }: { state: SystemState }) {
   return <section className="market-panel panel" aria-labelledby="market-title">
     <div className="section-head">
       <div><span className="eyebrow">LIVE PRICE LADDER</span><h2 id="market-title">价格阶梯</h2></div>
-      <div className={`feed-status ${state.connection.status === 'error' ? 'feed-error' : ''}`}><i /><span>{state.market.source === 'GMO' ? 'GMO 线上行情' : '模拟行情'}</span><b>{time(state.market.timestamp)}</b></div>
+      <div className={`feed-status ${state.connection.status === 'error' ? 'feed-error' : ''}`}><i /><span>{state.market.source === 'GMO' ? 'GMO 线上行情' : 'Paper 行情流'}</span><b>{time(state.market.timestamp)}</b></div>
     </div>
     <div className="ladder">
       <div className="ladder-row client ask">
@@ -89,9 +91,65 @@ function Reconciliation({ state }: { state: SystemState }) {
     </div>
     <div className="risk-lines">
       <div><span><Gauge size={18} /> 对冲延迟 P95</span><b>{state.metrics.hedgeP95Ms || '—'}{state.metrics.hedgeP95Ms ? ' ms' : ''}</b></div>
-      <div><span><ShieldCheck size={18} /> Maker 盈利下限</span><b>{(state.config.spreadBps - state.config.bittradeMakerFeeBps - state.config.gmoFeeBps - state.config.expectedSlippageBps).toFixed(1)} bps</b></div>
+      <div><span><ShieldCheck size={18} /> SOK 混合净边际</span><b>{(state.config.spreadBps - state.config.bittradeMakerFeeBps - blendedGmoFee(state.config) - Math.max(state.config.expectedSlippageBps, state.config.maxHedgeSlippageBps)).toFixed(1)} bps</b></div>
       <div><span><Lightning size={18} /> Rust 核心 P99</span><b>{state.metrics.coreCalcP99Us ? `${state.metrics.coreCalcP99Us.toFixed(2)} µs` : '采样中'}</b></div>
       <div><span><Pulse size={18} /> 运行时长</span><b>{Math.floor(state.metrics.uptimeSec / 60)}m {state.metrics.uptimeSec % 60}s</b></div>
+    </div>
+  </section>
+}
+
+function Holdings({ state }: { state: SystemState }) {
+  const base = state.instrument.baseAsset
+  const assets = ['JPY', base]
+  const venues = [
+    { key: 'bittrade', name: 'BitTrade', role: '做市账户' },
+    { key: 'gmo', name: 'GMO', role: '对冲账户' },
+  ] as const
+  const sourceLabel = state.holdings.source === 'paper'
+    ? 'Paper 账本'
+    : state.holdings.source === 'exchange' ? '交易所余额' : '等待余额同步'
+  const formatAmount = (value: number, asset: string) => asset === 'JPY' ? `¥${jpy.format(value)}` : decimal.format(value)
+  const formatChange = (value: number | null, asset: string) => value === null
+    ? '—'
+    : `${value > 0 ? '+' : value < 0 ? '−' : ''}${formatAmount(Math.abs(value), asset)}`
+  const combinedChange = (asset: string) => {
+    const maker = state.holdings.bittrade[asset]?.change
+    const hedge = state.holdings.gmo[asset]?.change
+    return maker == null || hedge == null ? null : maker + hedge
+  }
+  const baseChange = combinedChange(base)
+  const jpyChange = combinedChange('JPY')
+
+  return <section className="holdings-panel panel" aria-labelledby="holdings-title">
+    <div className="section-head holdings-head">
+      <div><span className="eyebrow">VENUE HOLDINGS / {base}_JPY</span><h2 id="holdings-title">双交易所持仓</h2></div>
+      <div className="holdings-meta">
+        <span className={`holdings-source ${state.holdings.source}`}><i />{sourceLabel}</span>
+        <small>{state.holdings.updatedAt ? `更新于 ${time(state.holdings.updatedAt)}` : '尚未取得私有余额'}</small>
+      </div>
+    </div>
+    <div className="holdings-summary" aria-label="合并持仓变化">
+      <div><span>合并 {base} 变化</span><b className={baseChange === 0 ? 'neutral' : (baseChange ?? 0) > 0 ? 'positive' : 'negative'}>{formatChange(baseChange, base)} <small>{base}</small></b></div>
+      <div><span>合并 JPY 变化</span><b className={(jpyChange ?? 0) >= 0 ? 'positive' : 'negative'}>{formatChange(jpyChange, 'JPY')}</b></div>
+      <p>{baseChange === null ? 'Live 模式会在私有余额同步完成后显示实际持仓。' : Math.abs(baseChange) < 1e-10 ? '双边资产已闭环；日元变化包含成交价差与手续费。' : `仍有 ${decimal.format(Math.abs(baseChange))} ${base} 未完成资产闭环。`}</p>
+    </div>
+    <div className="holdings-grid">
+      {venues.map(venue => <article className="venue-holdings" key={venue.key}>
+        <header><div><strong>{venue.name}</strong><span>{venue.role}</span></div><ArrowsLeftRight size={19} /></header>
+        <div className="holding-labels"><span>资产</span><span>当前可用</span><span>本轮变化</span></div>
+        {assets.map(asset => {
+          const holding = state.holdings[venue.key][asset]
+          const change = holding?.change ?? null
+          return <div className="holding-row" key={asset}>
+            <div className="holding-asset"><b>{asset}</b><small>配置 {formatAmount(holding?.configured ?? 0, asset)}</small></div>
+            <strong className="holding-current">{holding?.available == null ? '—' : formatAmount(holding.available, asset)}</strong>
+            <div className={`holding-change ${change == null || change === 0 ? 'neutral' : change > 0 ? 'positive' : 'negative'}`}>
+              <b>{formatChange(change, asset)}</b>
+              <small>{holding?.opening == null ? '等待同步' : `起始 ${formatAmount(holding.opening, asset)}`}</small>
+            </div>
+          </div>
+        })}
+      </article>)}
     </div>
   </section>
 }
@@ -100,10 +158,14 @@ function Trades({ state }: { state: SystemState }) {
   return <section className="table-section" aria-labelledby="trade-title">
     <div className="section-head wide">
       <div><span className="eyebrow">MATCHED EXECUTIONS</span><h2 id="trade-title">双边成交明细</h2></div>
-      <span className="muted">最近 {state.trades.length} 笔 · BitTrade 成交 → GMO 反向对冲</span>
+      <div className="trade-head-actions">
+        <span className="muted">最近 {state.trades.length} 笔 · BitTrade 成交 → GMO 反向对冲</span>
+        <a className="export-link" href="/api/orders/export?format=csv&amp;mode=all"><DownloadSimple size={15} />导出全部 CSV</a>
+        <a className="export-link" href="/api/orders/export?format=json&amp;mode=all"><DownloadSimple size={15} />JSON</a>
+      </div>
     </div>
     {state.trades.length === 0 ? <div className="empty-state">
-      <ArrowsLeftRight size={30} /><div><b>尚无双边成交</b><span>使用右上角“模拟成交”验证报价、对冲与对账闭环。</span></div>
+      <ArrowsLeftRight size={30} /><div><b>尚无双边成交</b><span>Paper 撮合器会通过真实引擎链路生成订单、成交与对冲。</span></div>
     </div> : <div className="table-wrap"><table>
       <thead><tr><th>时间 / 交易编号</th><th>客户方向</th><th className="num">数量 {state.instrument.baseAsset}</th><th className="num">BitTrade 成交</th><th className="num">GMO 对冲</th><th className="num">延迟</th><th className="num">净收益 JPY</th></tr></thead>
       <tbody>{state.trades.map(trade => <tr key={trade.id}>
@@ -119,7 +181,7 @@ function Trades({ state }: { state: SystemState }) {
   </section>
 }
 
-function Settings({ state, onClose, onSaved }: { state: SystemState; onClose: () => void; onSaved: () => void }) {
+function Settings({ state, risk, onClose, onSaved }: { state: SystemState; risk: RiskStatus | null; onClose: () => void; onSaved: () => void }) {
   const [form, setForm] = useState(state.config)
   const [mode, setMode] = useState<SystemState['mode']>(state.mode)
   const [confirmed, setConfirmed] = useState(false)
@@ -133,6 +195,19 @@ function Settings({ state, onClose, onSaved }: { state: SystemState; onClose: ()
   const [inventory, setInventory] = useState<InventoryState>({ bittrade: {}, gmo: {}, webhookConfigured: false, webhookHint: null, disabledSymbols: {} })
   const [webhookUrl, setWebhookUrl] = useState('')
   const [clearWebhook, setClearWebhook] = useState(false)
+  const defaultGmoFee = (asset: string) => ['BTC', 'ETH', 'XRP', 'DAI'].includes(asset) ? 5 : 9
+  const defaultGmoMakerFee = (asset: string) => ['BTC', 'ETH', 'XRP', 'DAI'].includes(asset) ? -1 : -3
+  const [gmoFees, setGmoFees] = useState<Record<string, number>>(Object.fromEntries(
+    Object.values(state.symbolStates).map(runtime => [runtime.instrument.baseAsset, runtime.config.gmoFeeBps]),
+  ))
+  const [gmoMakerFees, setGmoMakerFees] = useState<Record<string, number>>(Object.fromEntries(
+    Object.values(state.symbolStates).map(runtime => [runtime.instrument.baseAsset, runtime.config.gmoMakerFeeBps]),
+  ))
+  const [riskLimits, setRiskLimits] = useState<RiskLimits>(risk?.limits ?? {
+    maxSingleOrderJpy: 250000, maxDailyVolumeJpy: 5000000, maxDailyLossJpy: 100000,
+    maxAbsDelta: .005, maxHedgeFailures: 3, maxHedgeP95Ms: 2500, armTtlSec: 3600,
+  })
+  const [paperScenarios, setPaperScenarios] = useState<PaperScenarios | null>(null)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
   const set = (key: keyof typeof form, value: string) => setForm(v => ({ ...v, [key]: key === 'symbol' ? value : Number(value) }))
@@ -144,6 +219,8 @@ function Settings({ state, onClose, onSaved }: { state: SystemState; onClose: ()
       .finally(() => { if (active) setSymbolsLoading(false) })
     api('/api/inventory').then(data => { if (active) setInventory(data) })
       .catch(e => { if (active) setSymbolsError(e instanceof Error ? e.message : '底仓配置加载失败') })
+    api('/api/risk/limits').then(data => { if (active) setRiskLimits(data) }).catch(() => undefined)
+    if (state.mode === 'paper') api('/api/paper/scenarios').then(data => { if (active) setPaperScenarios(data) }).catch(() => undefined)
     return () => { active = false }
   }, [])
   const toggleSymbol = (symbol: string) => setSelectedSymbols(value => value.includes(symbol)
@@ -156,7 +233,21 @@ function Settings({ state, onClose, onSaved }: { state: SystemState; onClose: ()
   const save = async () => {
     setSaving(true); setError('')
     try {
-      await api('/api/strategy', { method: 'PATCH', body: JSON.stringify({ ...form, symbols: selectedSymbols }) })
+      await api('/api/strategy', { method: 'PATCH', body: JSON.stringify({
+        ...form, symbols: selectedSymbols,
+        gmoFeeBpsByAsset: Object.fromEntries(selectedSymbols.map(symbol => {
+          const asset = symbol.replace('_JPY', '')
+          return [asset, gmoFees[asset] ?? defaultGmoFee(asset)]
+        })),
+        gmoMakerFeeBpsByAsset: Object.fromEntries(selectedSymbols.map(symbol => {
+          const asset = symbol.replace('_JPY', '')
+          return [asset, gmoMakerFees[asset] ?? defaultGmoMakerFee(asset)]
+        })),
+      }) })
+      await api('/api/risk/limits', { method: 'PATCH', body: JSON.stringify(riskLimits) })
+      if (state.mode === 'paper' && paperScenarios) {
+        await api('/api/paper/scenarios', { method: 'PATCH', body: JSON.stringify(paperScenarios) })
+      }
       const assets = ['JPY', ...selectedSymbols.map(symbol => symbol.replace('_JPY', ''))]
       await api('/api/inventory', { method: 'PATCH', body: JSON.stringify({
         bittrade: Object.fromEntries(assets.map(asset => [asset, inventory.bittrade[asset] ?? 0])),
@@ -192,16 +283,41 @@ function Settings({ state, onClose, onSaved }: { state: SystemState; onClose: ()
         {!symbolsLoading && !symbolsError && <p className={selectedSymbols.length ? 'field-note' : 'field-error'}>{selectedSymbols.length ? '各币种独立维护行情、仓位、Delta、成交和 P&L。' : '请至少选择一个币种。'}</p>}
       </div>
       <div className="settings-section">
-        <div className="settings-title"><div><b>运行模式</b><small>线上模式使用 GMO 实时行情</small></div><span className={`connection-dot ${state.connection.status}`} /> </div>
+        <div className="settings-title"><div><b>运行模式</b><small>Paper / Live 在交易所边界分叉，切换后需重启服务</small></div><span className={`connection-dot ${state.connection.status}`} /> </div>
         <div className="mode-selector">
-          <button className={mode === 'simulation' ? 'active' : ''} onClick={() => setMode('simulation')} type="button">模拟模式</button>
-          <button className={mode === 'online' ? 'active online' : ''} onClick={() => setMode('online')} type="button">线上模式</button>
+          <button className={mode === 'paper' ? 'active' : ''} onClick={() => setMode('paper')} type="button">Paper 模式</button>
+          <button className={mode === 'live' ? 'active online' : ''} onClick={() => setMode('live')} type="button">Live 模式</button>
         </div>
-        {mode === 'online' && <label className="confirm-row"><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} /><span>我确认线上模式会连接真实账户；下单仍需在主界面输入确认短语单独 Arm</span></label>}
+        {mode === 'live' && <label className="confirm-row"><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} /><span>我确认 Live 模式会连接真实账户；下单仍需在主界面输入确认短语单独 Arm</span></label>}
       </div>
 
+      {state.mode === 'paper' && paperScenarios && <div className="settings-section">
+        <div className="settings-title"><div><b>Paper 坏情况注入</b><small>每个开关都作用于 Fake 交易所边界，覆盖真实引擎代码</small></div></div>
+        <div className="paper-scenario-grid">
+          {([
+            ['autoMatch', '自动撮合'], ['partialFills', '2–5 次部分成交'], ['dustFills', '小于 GMO 最小量'],
+            ['duplicateEvents', '重复成交推送'], ['outOfOrderEvents', '乱序累计量'],
+            ['cancelAlreadyFilled', '撤单时已成交'], ['cancelRaceFill', '撤单竞速全成'],
+            ['gmoPartialFak', 'GMO FAK 部分成交'], ['delayedExecutions', 'GMO 成交延迟'],
+            ['postOnlyReject', 'Post-only 拒单'], ['randomRateLimit', '随机 429'],
+            ['randomNetworkTimeout', '随机网络超时'],
+          ] as Array<[keyof PaperScenarios, string]>).map(([key, label]) => <label className="confirm-row" key={key}>
+            <input type="checkbox" checked={Boolean(paperScenarios[key])} onChange={e => setPaperScenarios(value => value ? ({ ...value, [key]: e.target.checked }) : value)} />
+            <span>{label}</span>
+          </label>)}
+        </div>
+        <div className="form-pair">
+          <label><span>自动撮合概率 / tick</span><input className="secret-input" type="number" min="0" max="1" step="0.01" value={paperScenarios.autoMatchProbability} onChange={e => setPaperScenarios(v => v ? ({ ...v, autoMatchProbability: Number(e.target.value) }) : v)} /></label>
+          <label><span>GMO 部分成交比例</span><input className="secret-input" type="number" min="0.01" max="1" step="0.05" value={paperScenarios.gmoFillRatio} onChange={e => setPaperScenarios(v => v ? ({ ...v, gmoFillRatio: Number(e.target.value) }) : v)} /></label>
+          <label><span>GMO SOK 被动成交比例</span><input className="secret-input" type="number" min="0" max="1" step="0.05" value={paperScenarios.gmoPostOnlyFillRatio} onChange={e => setPaperScenarios(v => v ? ({ ...v, gmoPostOnlyFillRatio: Number(e.target.value) }) : v)} /></label>
+          <label><span>GMO SOK 模拟成交延迟 ms</span><input className="secret-input" type="number" min="0" max="10000" value={paperScenarios.gmoPostOnlyFillDelayMs} onChange={e => setPaperScenarios(v => v ? ({ ...v, gmoPostOnlyFillDelayMs: Number(e.target.value) }) : v)} /></label>
+          <label><span>executions 最短延迟 ms</span><input className="secret-input" type="number" min="0" max="10000" value={paperScenarios.executionDelayMinMs} onChange={e => setPaperScenarios(v => v ? ({ ...v, executionDelayMinMs: Number(e.target.value) }) : v)} /></label>
+          <label><span>executions 最长延迟 ms</span><input className="secret-input" type="number" min="0" max="10000" value={paperScenarios.executionDelayMaxMs} onChange={e => setPaperScenarios(v => v ? ({ ...v, executionDelayMaxMs: Number(e.target.value) }) : v)} /></label>
+        </div>
+      </div>}
+
       <div className="settings-section credentials-section">
-        <div className="settings-title"><div><b>GMO Coin API</b><small>{state.connection.gmoConfigured ? `已配置 ${state.connection.gmoKeyHint}` : '未配置 · 线上公开行情无需密钥'}</small></div>{state.connection.gmoConfigured && <button type="button" className="clear-button" onClick={() => setClearGmo(v => !v)}>{clearGmo ? '保留' : '清除'}</button>}</div>
+        <div className="settings-title"><div><b>GMO Coin API</b><small>{state.connection.gmoConfigured ? `已配置 ${state.connection.gmoKeyHint}` : '未配置 · Live 公开行情无需密钥'}</small></div>{state.connection.gmoConfigured && <button type="button" className="clear-button" onClick={() => setClearGmo(v => !v)}>{clearGmo ? '保留' : '清除'}</button>}</div>
         <label><span>API Key</span><input className="secret-input" type="password" autoComplete="new-password" placeholder={state.connection.gmoConfigured ? '留空则保留现有密钥' : '输入 GMO API Key'} value={secrets.gmoApiKey} onChange={e => setSecret('gmoApiKey', e.target.value)} /></label>
         <label><span>Secret Key</span><input className="secret-input" type="password" autoComplete="new-password" placeholder={state.connection.gmoConfigured ? '留空则保留现有密钥' : '输入 GMO Secret Key'} value={secrets.gmoSecretKey} onChange={e => setSecret('gmoSecretKey', e.target.value)} /></label>
       </div>
@@ -231,16 +347,50 @@ function Settings({ state, onClose, onSaved }: { state: SystemState; onClose: ()
       <label><span>BitTrade 加价幅度</span><div className="input-with-unit"><input type="number" step="0.1" value={form.spreadBps} onChange={e => set('spreadBps', e.target.value)} /><i>bps</i></div><small>必须高于手续费与预期滑点之和</small></label>
       <div className="form-pair">
         <label><span>BitTrade Maker 费率</span><div className="input-with-unit"><input type="number" step="0.01" value={form.bittradeMakerFeeBps} onChange={e => set('bittradeMakerFeeBps', e.target.value)} /><i>bps</i></div></label>
-        <label><span>GMO Taker 费率</span><div className="input-with-unit"><input type="number" value={form.gmoFeeBps} disabled readOnly /><i>bps</i></div><small>按币种自动：BTC/ETH/XRP/DAI 为 5，其余为 9</small></label>
+        <label><span>预期滑点</span><div className="input-with-unit"><input type="number" step="0.1" value={form.expectedSlippageBps} onChange={e => set('expectedSlippageBps', e.target.value)} /><i>bps</i></div></label>
+        <label><span>累计深度滑点范围</span><div className="input-with-unit"><input type="number" min="0" step="0.1" value={form.maxHedgeSlippageBps} onChange={e => set('maxHedgeSlippageBps', e.target.value)} /><i>bps</i></div></label>
+        <label><span>BitTrade 排队预算</span><div className="input-with-unit"><input type="number" min="0" step="0.001" value={form.queueBudget} onChange={e => set('queueBudget', e.target.value)} /><i>币</i></div></label>
+      </div>
+      <div className="settings-section fee-section">
+        <div className="settings-title"><div><b>GMO Taker 费率（每币种）</b><small>可按账户实际费率覆盖；未设置时采用公开费率表</small></div></div>
+        <div className="fee-grid">
+          {selectedSymbols.map(symbol => {
+            const asset = symbol.replace('_JPY', '')
+            return <label key={asset}><span>{asset}</span><div className="input-with-unit"><input type="number" min="0" max="100" step="0.01" value={gmoFees[asset] ?? defaultGmoFee(asset)} onChange={e => setGmoFees(current => ({ ...current, [asset]: Number(e.target.value) }))} /><i>bps</i></div></label>
+          })}
+        </div>
       </div>
       <div className="form-pair">
-        <label><span>预期滑点</span><div className="input-with-unit"><input type="number" step="0.1" value={form.expectedSlippageBps} onChange={e => set('expectedSlippageBps', e.target.value)} /><i>bps</i></div></label>
+        <label><span>预计 SOK 成交比例</span><div className="input-with-unit"><input type="number" min="0" max="1" step="0.05" value={form.expectedPassiveFillRatio} onChange={e => set('expectedPassiveFillRatio', e.target.value)} /><i>ratio</i></div></label>
+        <label><span>SOK 等待后兜底</span><div className="input-with-unit"><input type="number" min="100" max="10000" step="50" value={form.gmoPostOnlyTimeoutMs} onChange={e => set('gmoPostOnlyTimeoutMs', e.target.value)} /><i>ms</i></div></label>
+        <label><span>预计 GMO 混合费率</span><div className="input-with-unit"><input readOnly value={((gmoMakerFees[state.instrument.baseAsset] ?? defaultGmoMakerFee(state.instrument.baseAsset)) * form.expectedPassiveFillRatio + (gmoFees[state.instrument.baseAsset] ?? defaultGmoFee(state.instrument.baseAsset)) * (1 - form.expectedPassiveFillRatio)).toFixed(2)} /><i>bps</i></div></label>
+      </div>
+      <div className="settings-section fee-section">
+        <div className="settings-title"><div><b>GMO SOK Maker 费率（每币种）</b><small>负数表示返佣；BTC/ETH/XRP/DAI 默认 -1 bps，其余默认 -3 bps</small></div></div>
+        <div className="fee-grid">
+          {selectedSymbols.map(symbol => {
+            const asset = symbol.replace('_JPY', '')
+            return <label key={asset}><span>{asset}</span><div className="input-with-unit"><input type="number" min="-100" max="100" step="0.01" value={gmoMakerFees[asset] ?? defaultGmoMakerFee(asset)} onChange={e => setGmoMakerFees(current => ({ ...current, [asset]: Number(e.target.value) }))} /><i>bps</i></div></label>
+          })}
+        </div>
       </div>
       <label><span>单边最大挂单基准</span><div className="input-with-unit"><input type="number" step="0.0001" value={form.maxQuoteSize} onChange={e => set('maxQuoteSize', e.target.value)} /><i>AUTO</i></div><small>低于币种最小下单量时自动提升，超过最大量时自动收窄</small></label>
       <label><span>Delta 紧急停止阈值基准</span><div className="input-with-unit"><input type="number" step="0.0001" value={form.deltaLimit} onChange={e => set('deltaLimit', e.target.value)} /><i>AUTO</i></div><small>每个币种均独立计算，阈值不会低于该币种最小下单量</small></label>
       <label><span>最大对冲延迟</span><div className="input-with-unit"><input type="number" step="50" value={form.maxHedgeLatencyMs} onChange={e => set('maxHedgeLatencyMs', e.target.value)} /><i>ms</i></div></label>
+      <div className="settings-section risk-limit-section">
+        <div className="settings-title"><div><b>实盘自动闸门</b><small>修改任一限额会先自动 Disarm</small></div></div>
+        <div className="form-pair">
+          <label><span>单笔上限 JPY</span><input className="secret-input" type="number" min="1" value={riskLimits.maxSingleOrderJpy} onChange={e => setRiskLimits(v => ({ ...v, maxSingleOrderJpy: Number(e.target.value) }))} /></label>
+          <label><span>日成交额 JPY</span><input className="secret-input" type="number" min="1" value={riskLimits.maxDailyVolumeJpy} onChange={e => setRiskLimits(v => ({ ...v, maxDailyVolumeJpy: Number(e.target.value) }))} /></label>
+          <label><span>日最大亏损 JPY</span><input className="secret-input" type="number" min="1" value={riskLimits.maxDailyLossJpy} onChange={e => setRiskLimits(v => ({ ...v, maxDailyLossJpy: Number(e.target.value) }))} /></label>
+          <label><span>绝对 Delta</span><input className="secret-input" type="number" min="0" step="0.0001" value={riskLimits.maxAbsDelta} onChange={e => setRiskLimits(v => ({ ...v, maxAbsDelta: Number(e.target.value) }))} /></label>
+          <label><span>连续对冲失败</span><input className="secret-input" type="number" min="1" value={riskLimits.maxHedgeFailures} onChange={e => setRiskLimits(v => ({ ...v, maxHedgeFailures: Number(e.target.value) }))} /></label>
+          <label><span>对冲 P95 ms</span><input className="secret-input" type="number" min="1" value={riskLimits.maxHedgeP95Ms} onChange={e => setRiskLimits(v => ({ ...v, maxHedgeP95Ms: Number(e.target.value) }))} /></label>
+          <label><span>Arm 有效期 秒</span><input className="secret-input" type="number" min="60" value={riskLimits.armTtlSec} onChange={e => setRiskLimits(v => ({ ...v, armTtlSec: Number(e.target.value) }))} /></label>
+        </div>
+      </div>
       {error && <div className="inline-error"><Warning size={18} weight="fill" />{error}</div>}
-      <button className="primary full" onClick={save} disabled={saving || !selectedSymbols.length || (mode === 'online' && state.mode !== 'online' && !confirmed)}>{saving ? (mode === 'online' ? '正在初始化多币种行情…' : '保存中…') : `保存并运行 ${selectedSymbols.length} 个币种`}</button>
+      <button className="primary full" onClick={save} disabled={saving || !selectedSymbols.length || (mode === 'live' && !confirmed)}>{saving ? (mode === 'live' ? '正在初始化多币种行情…' : '保存中…') : `保存并运行 ${selectedSymbols.length} 个币种`}</button>
     </aside>
   </div>
 }
@@ -292,18 +442,23 @@ export function App() {
   const simulate = async () => {
     if (!quote) return
     setBusy('fill')
-    try { await api('/api/sim/fill', { method: 'POST', body: JSON.stringify({ symbol: activeSymbol, side: fillSide, size: simulateSize, role: 'maker' }) }) }
-    catch (e) { setError(e instanceof Error ? e.message : '模拟成交失败') }
+    try { await api('/api/paper/fill', { method: 'POST', body: JSON.stringify({ symbol: activeSymbol, side: fillSide, size: simulateSize, role: 'maker' }) }) }
+    catch (e) { setError(e instanceof Error ? e.message : 'Paper 成交注入失败') }
     finally { setBusy('') }
   }
   const toggleArm = async () => {
     setBusy('arm')
     try {
-      const result = risk?.armed
-        ? await api('/api/risk/disarm', { method: 'POST' })
-        : await api('/api/risk/arm', { method: 'POST', body: JSON.stringify({
-          phrase: window.prompt('输入实盘确认短语') ?? '', actor: 'web-operator',
-        }) })
+      let result
+      if (risk?.armed) {
+        result = await api('/api/risk/disarm', { method: 'POST' })
+      } else {
+        const actor = window.prompt(risk?.pendingArmActor ? `第一位操作员：${risk.pendingArmActor}。请输入第二位操作员标识` : '输入当前操作员标识')
+        if (!actor?.trim()) return
+        const phrase = window.prompt('输入实盘确认短语')
+        if (!phrase) return
+        result = await api('/api/risk/arm', { method: 'POST', body: JSON.stringify({ phrase, actor: actor.trim() }) })
+      }
       setRisk(result)
     } catch (e) { setError(e instanceof Error ? e.message : '风控状态切换失败') }
     finally { setBusy('') }
@@ -315,7 +470,7 @@ export function App() {
     <header className="topbar">
       <div className="brand"><span>JARB</span><small>MARKET MAKING / HEDGE</small></div>
       <nav>
-        <span className={`mode ${state.mode}`}>{state.mode === 'simulation' ? '模拟模式' : '线上模式'}</span>
+        <span className={`mode ${state.mode}`}>{state.mode === 'paper' ? 'Paper 模式' : 'Live 模式'}</span>
         <span className={`live-pill ${state.running ? 'on' : ''}`}><i />{state.running ? '策略运行中' : '报价已暂停'}</span>
         <button className="icon-button" onClick={() => setSettings(true)} aria-label="打开策略参数"><SlidersHorizontal size={20} /></button>
       </nav>
@@ -334,15 +489,15 @@ export function App() {
         })}
       </div>
       <section className="intro">
-        <div><span className="eyebrow">LIQUIDITY OPERATIONS / {viewState.market.symbol}</span><h1>做市与即时对冲</h1><p>{state.mode === 'online' ? `正在并发运行 ${state.activeSymbols.length} 个 GMO 实时行情策略；当前查看 ${viewState.instrument.baseAsset}/JPY。` : `正在并发运行 ${state.activeSymbols.length} 个模拟策略；当前查看 ${viewState.instrument.baseAsset}/JPY。`}</p></div>
+        <div><span className="eyebrow">LIQUIDITY OPERATIONS / {viewState.market.symbol}</span><h1>做市与即时对冲</h1><p>{state.mode === 'live' ? `正在并发运行 ${state.activeSymbols.length} 个 GMO 实时行情策略；当前查看 ${viewState.instrument.baseAsset}/JPY。` : `Paper 正通过完整引擎运行 ${state.activeSymbols.length} 个策略；当前查看 ${viewState.instrument.baseAsset}/JPY。`}</p></div>
         <div className="controls">
-          {state.mode === 'simulation' ? <div className="sim-control">
+          {state.mode === 'paper' ? <div className="sim-control">
             <button onClick={() => setFillSide('SELL')} className={fillSide === 'SELL' ? 'active' : ''}>客户买入</button>
             <button onClick={() => setFillSide('BUY')} className={fillSide === 'BUY' ? 'active' : ''}>客户卖出</button>
-            <button className="simulate" onClick={simulate} disabled={!state.running || busy === 'fill' || !simulateSize}><Lightning size={17} weight="fill" />{busy === 'fill' ? '对冲中…' : `模拟成交 ${decimal.format(simulateSize)} ${viewState.instrument.baseAsset}`}</button>
+            <button className="simulate" onClick={simulate} disabled={!state.running || busy === 'fill' || !simulateSize}><Lightning size={17} weight="fill" />{busy === 'fill' ? '注入中…' : `注入成交 ${decimal.format(simulateSize)} ${viewState.instrument.baseAsset}`}</button>
           </div> : <>
-            <div className={`online-note ${state.connection.status}`}><ShieldCheck size={17} />{state.connection.status === 'error' ? '线上行情异常' : risk?.armed ? '实盘已 Arm' : `DISARMED${risk?.reason ? ` · ${risk.reason}` : ''}`}</div>
-            <button className={risk?.armed ? 'kill active' : 'secondary'} onClick={toggleArm} disabled={!!busy || !risk?.recoveryComplete}>{risk?.armed ? 'Disarm 并撤单' : 'Arm 实盘'}</button>
+            <div className={`online-note ${state.connection.status}`}><ShieldCheck size={17} />{state.connection.status === 'error' ? 'Live 行情异常' : risk?.armed ? '实盘已 Arm' : `DISARMED${risk?.reason ? ` · ${risk.reason}` : ''}`}</div>
+            <button className={risk?.armed ? 'kill active' : 'secondary'} onClick={toggleArm} disabled={!!busy || !risk?.recoveryComplete}>{risk?.armed ? 'Disarm 并撤单' : risk?.pendingArmActor ? '第二人复核 Arm' : 'Arm 实盘'}</button>
           </>}
           <button className="secondary" onClick={() => control(state.running ? 'pause' : 'resume')} disabled={!!busy}>{state.running ? <Pause size={18} weight="fill" /> : <Play size={18} weight="fill" />}{state.running ? '暂停报价' : '恢复报价'}</button>
           <button className={`kill ${state.killSwitch ? 'active' : ''}`} onClick={() => control(state.killSwitch ? 'reset-kill' : 'kill')} disabled={!!busy}><Siren size={18} weight="fill" />{state.killSwitch ? '解除急停' : '紧急停止'}</button>
@@ -356,6 +511,7 @@ export function App() {
         <Metric label="全策略对账异常" value={`${state.metrics.exceptionCount}`} note={viewState.reconciliation.status === 'matched' ? '当前币种无未处理差额' : '当前币种需要立即处理'} tone={state.metrics.exceptionCount ? 'negative' : ''} />
       </section>
 
+      <Holdings state={viewState} />
       <div className="primary-grid"><MarketLadder state={viewState} /><Reconciliation state={viewState} /></div>
       <Trades state={viewState} />
 
@@ -377,6 +533,6 @@ export function App() {
     </main>
 
     <footer><span>并发币种：{state.activeSymbols.length} · 报价依据：GMO Coin</span><span>数据留存：JSONL · 各币种独立对账</span><button onClick={() => window.location.reload()}><ArrowClockwise size={15} />刷新连接</button></footer>
-    {settings && <Settings state={state} onClose={() => setSettings(false)} onSaved={() => undefined} />}
+    {settings && <Settings state={state} risk={risk} onClose={() => setSettings(false)} onSaved={() => undefined} />}
   </div>
 }

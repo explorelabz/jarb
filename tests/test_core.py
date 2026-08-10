@@ -26,6 +26,18 @@ def test_quotes_follow_decimal_price_tick():
     assert quotes[1].price == 24.152
 
 
+def test_quotes_use_cumulative_gmo_depth_inside_slippage_band():
+    market = MarketTop(
+        symbol="BTC_JPY", bid=100, ask=101, bidSize=.01, askSize=.01,
+        bids=[(100, .01), (99.98, .02), (99.96, .04), (99.90, 1)],
+        asks=[(101, .01), (101.02, .02), (101.04, .04), (101.10, 1)],
+        timestamp="", source="GMO",
+    )
+    quotes = make_quotes(market, config(maxQuoteSize=1, spreadBps=10, maxHedgeSlippageBps=5))
+    assert quotes[0].size == pytest.approx(.07)
+    assert quotes[1].size == pytest.approx(.07)
+
+
 def test_hedge_direction_is_opposite():
     assert opposite_side("BUY") == "SELL"
     assert opposite_side("SELL") == "BUY"
@@ -51,10 +63,15 @@ def test_maker_profitability_floor():
         validate_config(config(spreadBps=3))
 
 
+def test_latency_limit_leaves_room_for_sok_fallback_confirmation():
+    with pytest.raises(ValueError, match="SOK 等待时间"):
+        validate_config(config(maxHedgeLatencyMs=1900, gmoPostOnlyTimeoutMs=800))
+
+
 def test_bittrade_maker_fee_is_included_in_profitability_floor():
     with pytest.raises(ValueError, match="价差必须高于"):
-        validate_config(config(spreadBps=6, bittradeMakerFeeBps=1))
-    assert validate_config(config(spreadBps=6, bittradeMakerFeeBps=-1)) > 0
+        validate_config(config(spreadBps=4, bittradeMakerFeeBps=1))
+    assert validate_config(config(spreadBps=4, bittradeMakerFeeBps=-1)) > 0
 
 
 def test_gmo_taker_fee_is_selected_per_base_asset():

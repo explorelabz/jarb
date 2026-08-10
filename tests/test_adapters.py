@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -27,6 +28,31 @@ async def test_gmo_market_top_uses_real_best_level_depth():
         market = await GmoAdapter(client=client).ticker("BTC")
     assert market.bidSize == .1234
     assert market.askSize == .0567
+    assert market.bids == [(17400000.0, .1234)]
+    assert market.asks == [(17410000.0, .0567)]
+
+
+@pytest.mark.asyncio
+async def test_gmo_post_only_order_uses_limit_sok_and_cancel_endpoint():
+    requests: list[tuple[str, str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        requests.append((request.method, request.url.path, body))
+        return httpx.Response(200, json={"status": 0, "data": {"orderId": 123}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = GmoAdapter("key", "secret", client)
+        await adapter.post_only_order(
+            "BTC_JPY", "BUY", Decimal("0.01"), Decimal("100.9"),
+            Decimal("0.0001"), Decimal("1"),
+        )
+        await adapter.cancel_order("123")
+    assert requests[0][1:] == ("/private/v1/order", {
+        "symbol": "BTC", "side": "BUY", "executionType": "LIMIT",
+        "timeInForce": "SOK", "price": "100", "size": "0.01",
+    })
+    assert requests[1][1:] == ("/private/v1/cancelOrder", {"orderId": 123})
 
 
 @pytest.mark.asyncio

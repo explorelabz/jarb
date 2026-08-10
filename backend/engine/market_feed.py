@@ -72,10 +72,13 @@ class GmoPublicWS:
                             continue
                         base = str(payload["symbol"]).upper()
                         symbol = base if base.endswith("_JPY") else f"{base}_JPY"
+                        bid_levels = [(float(row["price"]), float(row["size"])) for row in bids]
+                        ask_levels = [(float(row["price"]), float(row["size"])) for row in asks]
                         market = MarketTop(
                             symbol=symbol,
                             bid=float(bids[0]["price"]), ask=float(asks[0]["price"]),
                             bidSize=float(bids[0]["size"]), askSize=float(asks[0]["size"]),
+                            bids=bid_levels, asks=ask_levels,
                             timestamp=str(payload.get("timestamp") or datetime.now(timezone.utc).isoformat()),
                             source="GMO",
                         )

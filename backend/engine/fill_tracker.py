@@ -50,6 +50,7 @@ class FillTracker:
         self.poll_interval_sec = poll_interval_sec
         self.on_fill = on_fill
         self._tasks: list[asyncio.Task] = []
+        self._callback_tasks: set[asyncio.Task] = set()
 
     async def ingest(self, event: CumulativeFillEvent) -> FillDelta | None:
         delta = await self.store.record_cumulative_fill(
@@ -64,9 +65,13 @@ class FillTracker:
             occurred_at=event.occurred_at or datetime.now(timezone.utc).isoformat(),
         )
         if delta is not None:
-            if self.on_fill is not None:
-                await self.on_fill(delta)
+            # Hedge creation is the critical path. Publish the durably recorded delta
+            # before balance/UI projection so a slow dashboard query cannot delay GMO.
             await self.events.publish(EventType.FILL, delta)
+            if self.on_fill is not None:
+                task = asyncio.create_task(self._notify_fill(delta), name="fill-projection")
+                self._callback_tasks.add(task)
+                task.add_done_callback(self._callback_tasks.discard)
         return delta
 
     async def start(self, ws_stream: AsyncIterator[CumulativeFillEvent] | None = None) -> None:
@@ -84,6 +89,18 @@ class FillTracker:
             except asyncio.CancelledError:
                 pass
         self._tasks.clear()
+        callbacks = tuple(self._callback_tasks)
+        for task in callbacks:
+            task.cancel()
+        if callbacks:
+            await asyncio.gather(*callbacks, return_exceptions=True)
+        self._callback_tasks.clear()
+
+    async def _notify_fill(self, delta: FillDelta) -> None:
+        try:
+            await self.on_fill(delta)
+        except Exception as exc:
+            await self.store.audit("fill.projection.error", "warning", str(exc)[:240])
 
     async def _consume_ws(self, stream: AsyncIterator[CumulativeFillEvent]) -> None:
         async for event in stream:
@@ -94,6 +111,9 @@ class FillTracker:
             try:
                 for event in await self.rest_source():
                     await self.ingest(event)
+                checkpoint = getattr(self.rest_source, "checkpoint", None)
+                if checkpoint is not None:
+                    await checkpoint()
             except Exception as exc:
                 await self.store.audit("fill.rest.error", "warning", str(exc)[:240])
             await asyncio.sleep(self.poll_interval_sec)
@@ -203,9 +223,38 @@ class BitTradeRestFillSource:
     def __init__(self, adapter: BitTradeAdapter, store: StateStore):
         self.adapter = adapter
         self.store = store
+        self._pending_checkpoint: int | None = None
 
     async def __call__(self) -> list[CumulativeFillEvent]:
-        return await self.for_orders(await self.store.open_orders())
+        open_orders = await self.store.open_orders()
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        last_processed = await self.store.get_state("last_processed_ts", None)
+        start_ms = int(last_processed) - 5_000 if last_processed is not None else now_ms - 86_400_000
+        payload = await self.adapter.recent_matches(start_time=str(max(0, start_ms)))
+        rows = payload.get("data", [])
+        if isinstance(rows, dict):
+            rows = rows.get("data", rows.get("list", []))
+        candidates = await self.store.orders_for_fill_reconciliation(limit=10_000)
+        by_exchange = {
+            str(order["exchange_order_id"]): order for order in candidates if order.get("exchange_order_id")
+        }
+        by_client = {order["client_order_id"]: order for order in candidates}
+        affected: dict[str, dict] = {order["client_order_id"]: order for order in open_orders}
+        for row in rows if isinstance(rows, list) else []:
+            exchange_id = row.get("order-id", row.get("orderId", row.get("order_id")))
+            client_id = row.get("client-order-id", row.get("clientOrderId", row.get("client_order_id")))
+            order = by_exchange.get(str(exchange_id)) if exchange_id is not None else None
+            if order is None and client_id is not None:
+                order = by_client.get(str(client_id))
+            if order is not None:
+                affected[order["client_order_id"]] = order
+        self._pending_checkpoint = now_ms
+        return await self.for_orders(list(affected.values()))
+
+    async def checkpoint(self) -> None:
+        if self._pending_checkpoint is not None:
+            await self.store.set_state("last_processed_ts", self._pending_checkpoint)
+            self._pending_checkpoint = None
 
     async def for_orders(self, orders: list[dict]) -> list[CumulativeFillEvent]:
         events: list[CumulativeFillEvent] = []
@@ -215,7 +264,10 @@ class BitTradeRestFillSource:
                 continue
             payload = await self.adapter.matches(exchange_id)
             cumulative = Decimal("0")
-            rows = sorted(payload.get("data", []), key=lambda row: (row.get("created-at", 0), row.get("trade-id", 0)))
+            rows = payload.get("data", [])
+            if isinstance(rows, dict):
+                rows = rows.get("data", rows.get("list", []))
+            rows = sorted(rows, key=lambda row: (row.get("created-at", 0), row.get("trade-id", 0)))
             for row in rows:
                 cumulative += Decimal(str(row.get("filled-amount", "0")))
                 timestamp = int(row.get("created-at", 0))

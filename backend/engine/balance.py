@@ -37,8 +37,22 @@ class BalanceCache:
             current = self._balances.setdefault((venue, asset), CachedBalance(Decimal("0")))
             current.available += delta
 
+    async def clear_balances(self) -> None:
+        async with self._lock:
+            self._balances.clear()
+
     def available(self, venue: str, asset: str) -> Decimal:
         return self._balances.get((venue, asset), CachedBalance(Decimal("0"))).available
+
+    def reserved(self, venue: str, asset: str) -> Decimal:
+        return self._balances.get((venue, asset), CachedBalance(Decimal("0"))).reserved
+
+    def assets(self, venue: str) -> set[str]:
+        normalized = venue.lower()
+        return {
+            asset for item_venue, asset in set(self._balances) | set(self._allocations)
+            if item_venue == normalized
+        }
 
     def stale(self) -> bool:
         return not self._balances or any(time.monotonic() - value.updated_at > self.ttl_sec for value in self._balances.values())

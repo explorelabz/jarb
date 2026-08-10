@@ -58,9 +58,12 @@ class GmoAdapter:
         book = payload.get("data", {})
         if payload.get("status") != 0 or not book.get("bids") or not book.get("asks"):
             raise RuntimeError(f"GMO orderbook failed: {payload.get('messages', payload)}")
+        bids = [(float(row["price"]), float(row["size"])) for row in book["bids"]]
+        asks = [(float(row["price"]), float(row["size"])) for row in book["asks"]]
         bid, ask = book["bids"][0], book["asks"][0]
         return MarketTop(symbol=f"{symbol}_JPY", bid=float(bid["price"]), ask=float(ask["price"]),
                          bidSize=float(bid["size"]), askSize=float(ask["size"]),
+                         bids=bids, asks=asks,
                          timestamp=payload.get("responsetime", datetime.now(timezone.utc).isoformat()), source="GMO")
 
     async def symbols(self) -> list[dict]:
@@ -76,6 +79,20 @@ class GmoAdapter:
         body = {"symbol": symbol.replace("_JPY", ""), "side": side, "executionType": "MARKET", "timeInForce": "FAK",
                 "size": decimal_string(size, size_step)}
         return await self._private("POST", "/v1/order", body=body)
+
+    async def post_only_order(self, symbol: str, side: Side, size: Decimal | float,
+                              price: Decimal | float, size_step: Decimal | float,
+                              price_tick: Decimal | float) -> dict:
+        body = {
+            "symbol": symbol.replace("_JPY", ""), "side": side,
+            "executionType": "LIMIT", "timeInForce": "SOK",
+            "price": decimal_string(price, price_tick),
+            "size": decimal_string(size, size_step),
+        }
+        return await self._private("POST", "/v1/order", body=body)
+
+    async def cancel_order(self, order_id: str) -> dict:
+        return await self._private("POST", "/v1/cancelOrder", body={"orderId": int(order_id)})
 
     async def executions(self, order_id: str) -> dict:
         return await self._private("GET", "/v1/executions", query={"orderId": order_id})

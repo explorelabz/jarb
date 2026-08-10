@@ -21,15 +21,29 @@ fn validate_profitability(spread_bps: f64, fee_bps: f64, slippage_bps: f64) -> P
     Ok(floor)
 }
 
+fn hedgeable_size(levels: &[(f64, f64)], reference: f64, max_slip_bps: f64, buy_hedge: bool) -> f64 {
+    let slip = max_slip_bps.max(0.0) / 10_000.0;
+    let limit = if buy_hedge {
+        reference * (1.0 + slip)
+    } else {
+        reference * (1.0 - slip)
+    };
+    levels.iter()
+        .take_while(|(price, _)| if buy_hedge { *price <= limit } else { *price >= limit })
+        .map(|(_, size)| size.max(0.0))
+        .sum()
+}
+
 #[pyfunction]
 fn make_quotes(
     bid: f64,
     ask: f64,
-    bid_size: f64,
-    ask_size: f64,
+    bid_levels: Vec<(f64, f64)>,
+    ask_levels: Vec<(f64, f64)>,
     spread_bps: f64,
     max_quote_size: f64,
     price_tick: f64,
+    max_slip_bps: f64,
 ) -> PyResult<Vec<(String, f64, f64, f64)>> {
     if bid <= 0.0 || ask <= bid || max_quote_size <= 0.0 || price_tick <= 0.0 {
         return Err(PyValueError::new_err("invalid market or quote size"));
@@ -37,9 +51,11 @@ fn make_quotes(
     let spread = spread_bps / 10_000.0;
     let buy_price = ((bid * (1.0 - spread)) / price_tick).floor() * price_tick;
     let sell_price = ((ask * (1.0 + spread)) / price_tick).ceil() * price_tick;
+    let sell_hedge_depth = hedgeable_size(&bid_levels, bid, max_slip_bps, false);
+    let buy_hedge_depth = hedgeable_size(&ask_levels, ask, max_slip_bps, true);
     Ok(vec![
-        ("BUY".into(), buy_price, bid_size.min(max_quote_size).max(0.0), bid),
-        ("SELL".into(), sell_price, ask_size.min(max_quote_size).max(0.0), ask),
+        ("BUY".into(), buy_price, sell_hedge_depth.min(max_quote_size).max(0.0), bid),
+        ("SELL".into(), sell_price, buy_hedge_depth.min(max_quote_size).max(0.0), ask),
     ])
 }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -34,6 +35,10 @@ class ExecutionGateway:
         self.risk = risk
         self.limiter = limiter
         self._replace_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._fill_reconciler: Callable[[dict], Awaitable[None]] | None = None
+
+    def set_fill_reconciler(self, callback: Callable[[dict], Awaitable[None]] | None) -> None:
+        self._fill_reconciler = callback
 
     async def place(self, *, symbol: str, side: str, qty: Decimal, price: Decimal,
                     size_step: Decimal, price_tick: Decimal, snapshot: RiskSnapshot) -> dict:
@@ -44,7 +49,9 @@ class ExecutionGateway:
             raise RuntimeError(f"order rejected by RiskGate: {reason}")
         sequence = await self.store.next_sequence(f"order-seq:{symbol}:{side}")
         client_order_id = f"{symbol.replace('_', '')}-{side}-{sequence}"
-        await self.store.create_order(client_order_id, symbol, side, qty, price)
+        await self.store.create_order(
+            client_order_id, symbol, side, qty, price, trading_mode=self.store.trading_mode,
+        )
         await self.store.transition_order(client_order_id, OrderState.PLACING)
         quote = DecimalQuote(side=side, price=price, size=qty, source_price=price)
         try:
@@ -82,13 +89,23 @@ class ExecutionGateway:
         async with lock:
             if current is not None:
                 canceled = await self.cancel(current)
-                if OrderState(canceled["state"]) != OrderState.CANCELED:
+                terminal = OrderState(canceled["state"])
+                if terminal == OrderState.FILLED:
+                    return canceled
+                if terminal != OrderState.CANCELED:
                     raise RuntimeError(f"old quote not confirmed canceled: {canceled['state']}")
             return await self.place(**new_order)
 
     async def cancel(self, order: dict) -> dict:
         client_id = order["client_order_id"]
         exchange_id = order.get("exchange_order_id")
+        latest = await self.store.order(client_id)
+        if latest is not None:
+            current = OrderState(latest["state"])
+            if current in (OrderState.FILLED, OrderState.CANCELED):
+                return latest
+            order = latest
+            exchange_id = latest.get("exchange_order_id") or exchange_id
         if not exchange_id:
             return await self.store.transition_order(
                 client_id, OrderState.UNKNOWN, error="cannot cancel without exchange order id",
@@ -118,11 +135,22 @@ class ExecutionGateway:
                 error=str(exc)[:240],
             )
         state = self._exchange_state(payload)
-        row = next(
-            (item for item in await self.store.open_orders() if item["client_order_id"] == client_order_id), None,
-        )
+        row = await self.store.order(client_order_id)
         if row is None:
             return {"client_order_id": client_order_id, "state": state}
+        if state in (OrderState.CANCELED, OrderState.FILLED) and self._fill_reconciler is not None:
+            try:
+                await self._fill_reconciler(row)
+            except Exception as exc:
+                return await self.store.transition_order(
+                    client_order_id, OrderState.UNKNOWN, exchange_order_id=exchange_order_id,
+                    error=f"fill reconciliation failed: {str(exc)[:200]}",
+                )
+            row = await self.store.order(client_order_id)
+            if row is None:
+                return {"client_order_id": client_order_id, "state": state}
+            if OrderState(row["state"]) in (OrderState.CANCELED, OrderState.FILLED):
+                return row
         current = OrderState(row["state"])
         if current == OrderState.CANCELING and state == OrderState.OPEN:
             return row
@@ -161,7 +189,14 @@ class ExecutionGateway:
             remaining = [row for row in await self.store.open_orders() if row["client_order_id"] in remote_client_ids]
             if not remaining:
                 for row in await self.store.open_orders():
+                    if self._fill_reconciler is not None:
+                        await self._fill_reconciler(row)
+                        refreshed = await self.store.order(row["client_order_id"])
+                        if refreshed is not None:
+                            row = refreshed
                     current = OrderState(row["state"])
+                    if current == OrderState.FILLED:
+                        continue
                     if current != OrderState.CANCELING:
                         await self.store.transition_order(row["client_order_id"], OrderState.UNKNOWN)
                     await self.store.transition_order(row["client_order_id"], OrderState.CANCELED)

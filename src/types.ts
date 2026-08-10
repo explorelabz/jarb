@@ -6,6 +6,20 @@ export interface RiskStatus {
   recoveryComplete: boolean
   killed: boolean
   reason: string | null
+  pendingArmActor: string | null
+  pendingArmUntil: number
+  requiresDualApproval: boolean
+  limits: RiskLimits
+}
+
+export interface RiskLimits {
+  maxSingleOrderJpy: number
+  maxDailyVolumeJpy: number
+  maxDailyLossJpy: number
+  maxAbsDelta: number
+  maxHedgeFailures: number
+  maxHedgeP95Ms: number
+  armTtlSec: number
 }
 
 export interface InventoryState {
@@ -14,6 +28,49 @@ export interface InventoryState {
   webhookConfigured: boolean
   webhookHint: string | null
   disabledSymbols: Record<string, string[]>
+}
+
+export interface PaperScenarios {
+  autoMatch: boolean
+  partialFills: boolean
+  dustFills: boolean
+  duplicateEvents: boolean
+  outOfOrderEvents: boolean
+  cancelAlreadyFilled: boolean
+  cancelRaceFill: boolean
+  gmoPartialFak: boolean
+  gmoPostOnlyFillRatio: number
+  gmoPostOnlyFillDelayMs: number
+  delayedExecutions: boolean
+  postOnlyReject: boolean
+  randomRateLimit: boolean
+  randomNetworkTimeout: boolean
+  autoMatchProbability: number
+  dustProbability: number
+  duplicateProbability: number
+  outOfOrderProbability: number
+  cancelRaceProbability: number
+  gmoFillRatio: number
+  executionDelayMinMs: number
+  executionDelayMaxMs: number
+  rateLimitProbability: number
+  networkTimeoutProbability: number
+  seed: number
+}
+
+export interface AssetHolding {
+  configured: number
+  opening: number | null
+  available: number | null
+  reserved: number
+  change: number | null
+}
+
+export interface HoldingsState {
+  source: 'paper' | 'exchange' | 'configured'
+  updatedAt: string | null
+  bittrade: Record<string, AssetHolding>
+  gmo: Record<string, AssetHolding>
 }
 
 export interface InstrumentRules {
@@ -40,10 +97,10 @@ export interface SymbolRuntime {
 }
 
 export interface SystemState {
-  mode: 'simulation' | 'online'
+  mode: 'paper' | 'live'
   running: boolean
   killSwitch: boolean
-  market: { symbol: string; bid: number; ask: number; bidSize: number; askSize: number; timestamp: string; source: string }
+  market: { symbol: string; bid: number; ask: number; bidSize: number; askSize: number; bids: [number, number][]; asks: [number, number][]; timestamp: string; source: string }
   quotes: Array<{ side: Side; price: number; size: number; sourcePrice: number }>
   position: number
   reconciliation: { symbol: string; clientNet: number; hedgeNet: number; delta: number; status: 'matched' | 'exception'; checkedAt: string }
@@ -56,11 +113,13 @@ export interface SystemState {
   }>
   events: Array<{ id: string; timestamp: string; level: 'info' | 'warning' | 'critical'; type: string; message: string }>
   config: {
-    symbol: string; spreadBps: number; bittradeMakerFeeBps: number; gmoFeeBps: number; expectedSlippageBps: number;
-    maxQuoteSize: number; deltaLimit: number; maxHedgeLatencyMs: number; staleMarketMs: number
+    symbol: string; spreadBps: number; bittradeMakerFeeBps: number; gmoFeeBps: number; gmoMakerFeeBps: number;
+    expectedPassiveFillRatio: number; gmoPostOnlyTimeoutMs: number; maxHedgeSlippageBps: number;
+    expectedSlippageBps: number; queueBudget: number; maxQuoteSize: number; deltaLimit: number;
+    maxHedgeLatencyMs: number; staleMarketMs: number
   }
   connection: {
-    status: 'simulation' | 'connecting' | 'connected' | 'error'
+    status: 'paper' | 'connecting' | 'connected' | 'error'
     gmoConfigured: boolean; gmoKeyHint: string | null
     bittradeConfigured: boolean; bittradeKeyHint: string | null
     lastError: string | null
@@ -69,4 +128,5 @@ export interface SystemState {
   activeSymbols: string[]
   symbolStates: Record<string, SymbolRuntime>
   disabledSymbols: Record<string, string[]>
+  holdings: HoldingsState
 }

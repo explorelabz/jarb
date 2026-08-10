@@ -79,6 +79,7 @@ class HedgeIntent:
     qty: Decimal
     filled_qty: Decimal
     filled_notional: Decimal
+    fee_jpy: Decimal
     status: HedgeStatus
     attempts: int
     latency_ms: int
