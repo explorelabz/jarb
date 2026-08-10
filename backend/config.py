@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from .models import StrategyConfig
+from .models import StrategyConfig, gmo_taker_bps
 
 
 def number(name: str, default: float) -> float:
@@ -13,16 +13,18 @@ def number(name: str, default: float) -> float:
         return default
 
 
+configured_symbol = os.getenv("SYMBOL", "BTC_JPY").upper()
+
 strategy_config = StrategyConfig(
-    symbol=os.getenv("SYMBOL", "BTC_JPY"),
-    spreadBps=number("SPREAD_BPS", 10),
+    symbol=configured_symbol,
+    spreadBps=number("SPREAD_BPS", 25),
     bittradeMakerFeeBps=number("BITTRADE_MAKER_FEE_BPS", 0),
-    gmoFeeBps=number("GMO_FEE_BPS", 2),
+    gmoFeeBps=gmo_taker_bps(configured_symbol.removesuffix("_JPY")),
     expectedSlippageBps=number("EXPECTED_SLIPPAGE_BPS", 1.5),
     maxQuoteSize=number("MAX_QUOTE_SIZE", 0.05),
     deltaLimit=number("DELTA_LIMIT", 0.005),
     maxHedgeLatencyMs=int(number("MAX_HEDGE_LATENCY_MS", 1000)),
-    staleMarketMs=int(number("STALE_MARKET_MS", 5000)),
+    staleMarketMs=int(number("STALE_MARKET_MS", 800)),
     quoteRefreshMs=int(number("QUOTE_REFRESH_MS", 1000)),
 )
 

@@ -56,6 +56,15 @@ class ExecutionGateway:
             )
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             return await self.store.transition_order(client_order_id, OrderState.UNKNOWN, error=str(exc)[:240])
+        except ExchangeAPIError as exc:
+            text = f"{exc.code or ''} {exc}".lower()
+            if any(marker in text for marker in (
+                "post only", "post-only", "would match", "immediately match", "limit maker",
+            )):
+                return await self.store.transition_order(
+                    client_order_id, OrderState.FAILED, error="post_only_reject",
+                )
+            return await self.store.transition_order(client_order_id, OrderState.FAILED, error=str(exc)[:240])
         except Exception as exc:
             return await self.store.transition_order(client_order_id, OrderState.FAILED, error=str(exc)[:240])
         exchange_order_id = self._order_id(payload)
@@ -160,12 +169,16 @@ class ExecutionGateway:
             await asyncio.sleep(.25)
         raise TimeoutError("cancel-all did not converge to zero open orders")
 
-    async def _wait_terminal(self, client_id: str, exchange_id: str) -> dict:
-        for _ in range(20):
+    async def _wait_terminal(self, client_id: str, exchange_id: str,
+                             timeout_sec: float = 10.0) -> dict:
+        deadline = asyncio.get_running_loop().time() + timeout_sec
+        delay = .05
+        while asyncio.get_running_loop().time() < deadline:
             row = await self.confirm(client_id, exchange_id)
             if OrderState(row["state"]) in (OrderState.CANCELED, OrderState.FILLED):
                 return row
-            await asyncio.sleep(.1)
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.6, .5)
         return await self.store.transition_order(client_id, OrderState.UNKNOWN, error="cancel confirmation timeout")
 
     @staticmethod

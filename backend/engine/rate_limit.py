@@ -67,6 +67,7 @@ class PriorityRateLimiter:
         self._sequence = count()
         self._condition = asyncio.Condition()
         self._worker: asyncio.Task | None = None
+        self._inflight: set[asyncio.Task] = set()
         self._blocked_until: dict[EndpointGroup, float] = {}
 
     async def start(self) -> None:
@@ -81,6 +82,17 @@ class PriorityRateLimiter:
             except asyncio.CancelledError:
                 pass
             self._worker = None
+        tasks = tuple(self._inflight)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._inflight.clear()
+        async with self._condition:
+            queued, self._queue = self._queue, []
+        for request in queued:
+            if not request.future.done():
+                request.future.cancel()
 
     async def submit(self, group: EndpointGroup, priority: Priority,
                      operation: Callable[[], Awaitable[Any]]) -> Any:
@@ -109,17 +121,34 @@ class PriorityRateLimiter:
                 continue
             if request.future.cancelled():
                 continue
-            try:
-                request.future.set_result(await request.operation())
-            except Exception as exc:
-                text = str(exc).lower()
-                rate_limited = any(marker in text for marker in ("429", "too many", "rate limit", "リクエストが多すぎ"))
-                max_attempts = 8 if request.group == EndpointGroup.HEDGE else 4
-                if rate_limited and request.attempts < max_attempts:
-                    request.attempts += 1
-                    self._blocked_until[request.group] = time.monotonic() + min(2 ** request.attempts * .1, 5)
-                    async with self._condition:
-                        heapq.heappush(self._queue, request)
-                        self._condition.notify()
-                else:
-                    request.future.set_exception(exc)
+            task = asyncio.create_task(self._execute(request), name=f"rate-limit-{request.group}")
+            self._inflight.add(task)
+            task.add_done_callback(self._inflight.discard)
+
+    async def _execute(self, request: _QueuedRequest) -> None:
+        try:
+            result = await request.operation()
+        except asyncio.CancelledError:
+            if not request.future.done():
+                request.future.cancel()
+            raise
+        except Exception as exc:
+            text = str(exc).lower()
+            rate_limited = any(
+                marker in text for marker in ("429", "too many", "rate limit", "リクエストが多すぎ")
+            )
+            max_attempts = 8 if request.group == EndpointGroup.HEDGE else 4
+            if rate_limited and request.attempts < max_attempts and not request.future.done():
+                request.attempts += 1
+                delay = min(2 ** request.attempts * .1, 5)
+                self._blocked_until[request.group] = time.monotonic() + delay
+                await asyncio.sleep(delay)
+                async with self._condition:
+                    heapq.heappush(self._queue, request)
+                    self._condition.notify()
+                return
+            if not request.future.done():
+                request.future.set_exception(exc)
+            return
+        if not request.future.done():
+            request.future.set_result(result)

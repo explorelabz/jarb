@@ -67,6 +67,7 @@ class FillDelta:
     incremental_qty: Decimal
     price: Decimal
     fee: Decimal
+    occurred_at: str
 
 
 @dataclass(frozen=True)
@@ -82,4 +83,5 @@ class HedgeIntent:
     attempts: int
     latency_ms: int
     created_at: str
+    source_fill_at: str
     exchange_order_id: str | None = None

@@ -24,7 +24,7 @@ class RiskLimits:
 @dataclass(frozen=True)
 class RiskSnapshot:
     market_age_ms: int = 0
-    stale_market_ms: int = 5_000
+    stale_market_ms: int = 800
     order_notional_jpy: float = 0
     daily_volume_jpy: float = 0
     daily_pnl_jpy: float = 0

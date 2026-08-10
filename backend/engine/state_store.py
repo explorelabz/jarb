@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS hedge_intents (
     latency_ms INTEGER NOT NULL DEFAULT 0,
     exchange_order_id TEXT,
     last_error TEXT,
+    source_fill_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(client_fill_id) REFERENCES fills(id)
@@ -124,6 +125,13 @@ class StateStore:
                 if "latency_ms" not in columns:
                     self._connection.execute(
                         "ALTER TABLE hedge_intents ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "source_fill_at" not in columns:
+                    self._connection.execute(
+                        "ALTER TABLE hedge_intents ADD COLUMN source_fill_at TEXT"
+                    )
+                    self._connection.execute(
+                        "UPDATE hedge_intents SET source_fill_at=created_at WHERE source_fill_at IS NULL"
                     )
 
     async def close(self) -> None:
@@ -216,7 +224,7 @@ class StateStore:
                 if incremental == 0:
                     return None
                 return FillDelta(cursor.lastrowid, client_order_id, order_id, trade_id, symbol, side,
-                                 cumulative_qty, incremental, price, fee)
+                                 cumulative_qty, incremental, price, fee, occurred_at)
             except Exception:
                 db.execute("ROLLBACK")
                 raise
@@ -229,8 +237,10 @@ class StateStore:
             db = self._db()
             intent_id = f"H-{uuid4().hex}"
             db.execute(
-                "INSERT OR IGNORE INTO hedge_intents(id,client_fill_id,symbol,side,qty,status) VALUES(?,?,?,?,?,?)",
-                (intent_id, fill.fill_id, fill.symbol, hedge_side, str(fill.incremental_qty), HedgeStatus.PENDING),
+                "INSERT OR IGNORE INTO hedge_intents(id,client_fill_id,symbol,side,qty,status,source_fill_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (intent_id, fill.fill_id, fill.symbol, hedge_side, str(fill.incremental_qty),
+                 HedgeStatus.PENDING, fill.occurred_at),
             )
             row = db.execute("SELECT * FROM hedge_intents WHERE client_fill_id=?", (fill.fill_id,)).fetchone()
             return self._intent(row)
@@ -329,16 +339,16 @@ class StateStore:
         return sum((Decimal(row["incremental_qty"]) * Decimal(row["price"]) for row in rows), Decimal("0"))
 
     async def daily_realized_pnl(self, day_prefix: str, *, maker_fee_bps: Decimal,
-                                 hedge_fee_bps: Decimal) -> Decimal:
+                                 hedge_fee_bps: Decimal | dict[str, Decimal]) -> Decimal:
         return await asyncio.to_thread(
             self._daily_realized_pnl_sync, day_prefix, maker_fee_bps, hedge_fee_bps,
         )
 
     def _daily_realized_pnl_sync(self, day_prefix: str, maker_fee_bps: Decimal,
-                                 hedge_fee_bps: Decimal) -> Decimal:
+                                 hedge_fee_bps: Decimal | dict[str, Decimal]) -> Decimal:
         with self._lock:
             rows = self._db().execute(
-                "SELECT f.side,f.incremental_qty,f.price,h.filled_qty,h.filled_notional "
+                "SELECT f.symbol,f.side,f.incremental_qty,f.price,h.filled_qty,h.filled_notional "
                 "FROM fills f JOIN hedge_intents h ON h.client_fill_id=f.id "
                 "WHERE f.occurred_at LIKE ? AND h.filled_qty > '0'",
                 (f"{day_prefix}%",),
@@ -352,8 +362,10 @@ class StateStore:
             client_notional = Decimal(row["price"]) * hedged_qty
             hedge_notional = Decimal(row["filled_notional"])
             spread = hedge_notional - client_notional if row["side"] == "BUY" else client_notional - hedge_notional
+            symbol_hedge_fee = hedge_fee_bps.get(row["symbol"], Decimal("9")) \
+                if isinstance(hedge_fee_bps, dict) else hedge_fee_bps
             pnl += spread - client_notional * maker_fee_bps / Decimal("10000") \
-                - hedge_notional * hedge_fee_bps / Decimal("10000")
+                - hedge_notional * symbol_hedge_fee / Decimal("10000")
         return pnl
 
     async def open_orders(self) -> list[dict]:
@@ -449,5 +461,6 @@ class StateStore:
             qty=Decimal(row["qty"]), filled_qty=Decimal(row["filled_qty"]),
             filled_notional=Decimal(row["filled_notional"]), status=HedgeStatus(row["status"]),
             attempts=row["attempts"], latency_ms=row["latency_ms"], created_at=row["created_at"],
+            source_fill_at=row["source_fill_at"] or row["created_at"],
             exchange_order_id=row["exchange_order_id"],
         )

@@ -7,6 +7,13 @@ from pydantic import BaseModel, Field
 
 Side = Literal["BUY", "SELL"]
 
+GMO_TAKER_BPS: dict[str, float] = {"BTC": 5.0, "ETH": 5.0, "XRP": 5.0, "DAI": 5.0}
+GMO_TAKER_BPS_DEFAULT = 9.0
+
+
+def gmo_taker_bps(base_asset: str) -> float:
+    return GMO_TAKER_BPS.get(base_asset.upper(), GMO_TAKER_BPS_DEFAULT)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -14,14 +21,14 @@ def utc_now() -> str:
 
 class StrategyConfig(BaseModel):
     symbol: str = "BTC_JPY"
-    spreadBps: float = Field(10, gt=0)
+    spreadBps: float = Field(25, gt=0)
     bittradeMakerFeeBps: float = Field(0, ge=-100, le=100)
-    gmoFeeBps: float = Field(2, ge=0)
+    gmoFeeBps: float = Field(5, ge=0)
     expectedSlippageBps: float = Field(1.5, ge=0)
     maxQuoteSize: float = Field(0.05, gt=0)
     deltaLimit: float = Field(0.005, gt=0)
     maxHedgeLatencyMs: int = Field(1000, gt=0)
-    staleMarketMs: int = Field(5000, gt=0)
+    staleMarketMs: int = Field(800, gt=0)
     quoteRefreshMs: int = Field(1000, ge=100)
 
 

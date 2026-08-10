@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from backend.core import make_quotes, matched_trade, opposite_side, reconcile, validate_config
-from backend.models import ClientFill, HedgeFill, MarketTop, StrategyConfig
+from backend.models import ClientFill, HedgeFill, MarketTop, StrategyConfig, gmo_taker_bps
 
 
 def config(**updates) -> StrategyConfig:
@@ -12,7 +12,7 @@ def config(**updates) -> StrategyConfig:
 
 def test_quotes_are_outside_gmo_and_depth_capped():
     market = MarketTop(symbol="BTC_JPY", bid=14_990_000, ask=15_010_000, bidSize=.02, askSize=.4, timestamp="", source="GMO")
-    quotes = make_quotes(market, config())
+    quotes = make_quotes(market, config(spreadBps=10))
     assert quotes[0].price == 14_975_010
     assert quotes[0].size == .02
     assert quotes[1].price == 15_025_010
@@ -21,7 +21,7 @@ def test_quotes_are_outside_gmo_and_depth_capped():
 
 def test_quotes_follow_decimal_price_tick():
     market = MarketTop(symbol="DOGE_JPY", bid=24.123, ask=24.127, bidSize=100, askSize=100, timestamp="", source="GMO")
-    quotes = make_quotes(market, config(maxQuoteSize=10), price_tick=.001)
+    quotes = make_quotes(market, config(maxQuoteSize=10, spreadBps=10), price_tick=.001)
     assert quotes[0].price == 24.098
     assert quotes[1].price == 24.152
 
@@ -53,5 +53,11 @@ def test_maker_profitability_floor():
 
 def test_bittrade_maker_fee_is_included_in_profitability_floor():
     with pytest.raises(ValueError, match="价差必须高于"):
-        validate_config(config(spreadBps=4, bittradeMakerFeeBps=1))
-    assert validate_config(config(spreadBps=4, bittradeMakerFeeBps=-1)) > 0
+        validate_config(config(spreadBps=6, bittradeMakerFeeBps=1))
+    assert validate_config(config(spreadBps=6, bittradeMakerFeeBps=-1)) > 0
+
+
+def test_gmo_taker_fee_is_selected_per_base_asset():
+    assert gmo_taker_bps("btc") == 5
+    assert gmo_taker_bps("DAI") == 5
+    assert gmo_taker_bps("DOGE") == 9

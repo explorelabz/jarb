@@ -231,7 +231,7 @@ function Settings({ state, onClose, onSaved }: { state: SystemState; onClose: ()
       <label><span>BitTrade 加价幅度</span><div className="input-with-unit"><input type="number" step="0.1" value={form.spreadBps} onChange={e => set('spreadBps', e.target.value)} /><i>bps</i></div><small>必须高于手续费与预期滑点之和</small></label>
       <div className="form-pair">
         <label><span>BitTrade Maker 费率</span><div className="input-with-unit"><input type="number" step="0.01" value={form.bittradeMakerFeeBps} onChange={e => set('bittradeMakerFeeBps', e.target.value)} /><i>bps</i></div></label>
-        <label><span>GMO 手续费</span><div className="input-with-unit"><input type="number" step="0.1" value={form.gmoFeeBps} onChange={e => set('gmoFeeBps', e.target.value)} /><i>bps</i></div></label>
+        <label><span>GMO Taker 费率</span><div className="input-with-unit"><input type="number" value={form.gmoFeeBps} disabled readOnly /><i>bps</i></div><small>按币种自动：BTC/ETH/XRP/DAI 为 5，其余为 9</small></label>
       </div>
       <div className="form-pair">
         <label><span>预期滑点</span><div className="input-with-unit"><input type="number" step="0.1" value={form.expectedSlippageBps} onChange={e => set('expectedSlippageBps', e.target.value)} /><i>bps</i></div></label>

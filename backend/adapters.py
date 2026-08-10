@@ -80,6 +80,9 @@ class GmoAdapter:
     async def executions(self, order_id: str) -> dict:
         return await self._private("GET", "/v1/executions", query={"orderId": order_id})
 
+    async def order(self, order_id: str) -> dict:
+        return await self._private("GET", "/v1/orders", query={"orderId": order_id})
+
     async def balances(self) -> dict:
         return await self._private("GET", "/v1/account/assets")
 
@@ -175,6 +178,20 @@ class BitTradeAdapter:
 
     async def matches(self, order_id: str) -> dict:
         return await self._private("GET", f"/v1/order/orders/{order_id}/matchresults")
+
+    async def depth(self, symbol: str) -> dict:
+        response = await self.client.get(
+            f"{self.BASE}/market/depth",
+            params={"symbol": symbol.lower().replace("_", ""), "type": "step0"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("status") != "ok":
+            raise ExchangeAPIError(
+                "BitTrade", str(payload.get("err-msg", payload)),
+                code=str(payload.get("err-code")) if payload.get("err-code") is not None else None,
+            )
+        return payload
 
     async def symbols(self) -> list[dict]:
         response = await self.client.get(f"{self.BASE}/v1/common/symbols")

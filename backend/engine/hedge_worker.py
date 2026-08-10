@@ -22,6 +22,8 @@ class HedgeExecution:
     order_id: str
     filled_qty: Decimal
     filled_notional: Decimal = Decimal("0")
+    submitted_at: str = ""
+    confirmed_at: str = ""
 
 
 class HedgeExecutor(Protocol):
@@ -103,7 +105,7 @@ class HedgeWorker:
                     await self.store.transition_hedge(
                         intent.id, target, filled_qty=total,
                         filled_notional=intent.filled_notional + allocated * average,
-                        latency_ms=self._latency_ms(intent),
+                        latency_ms=self._latency_ms(intent, result.confirmed_at),
                         exchange_order_id=result.order_id,
                         error=None if target == HedgeStatus.HEDGED else "recovered partial hedge",
                     )
@@ -210,7 +212,7 @@ class HedgeWorker:
             await self.store.transition_hedge(
                 intent.id, target, filled_qty=total_filled,
                 filled_notional=intent.filled_notional + allocated * average_price,
-                latency_ms=self._latency_ms(intent),
+                latency_ms=self._latency_ms(intent, result.confirmed_at),
                 exchange_order_id=result.order_id,
                 error=None if target == HedgeStatus.HEDGED else "GMO FAK partially filled",
             )
@@ -218,12 +220,16 @@ class HedgeWorker:
             self._wake.set()
 
     @staticmethod
-    def _latency_ms(intent: HedgeIntent) -> int:
+    def _latency_ms(intent: HedgeIntent, confirmed_at: str = "") -> int:
         try:
-            created = datetime.fromisoformat(intent.created_at.replace("Z", "+00:00"))
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            return max(0, int((datetime.now(timezone.utc) - created).total_seconds() * 1000))
+            started = datetime.fromisoformat(intent.source_fill_at.replace("Z", "+00:00"))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            confirmed = datetime.fromisoformat(confirmed_at.replace("Z", "+00:00")) \
+                if confirmed_at else datetime.now(timezone.utc)
+            if confirmed.tzinfo is None:
+                confirmed = confirmed.replace(tzinfo=timezone.utc)
+            return max(0, int((confirmed - started).total_seconds() * 1000))
         except ValueError:
             return 0
 
@@ -232,16 +238,18 @@ class GmoHedgeExecutor:
     """Submits GMO FAK orders and returns the exchange-confirmed executed quantity."""
 
     def __init__(self, adapter: GmoAdapter, limiter: PriorityRateLimiter,
-                 size_steps: dict[str, Decimal]):
+                 size_steps: dict[str, Decimal], *, fill_timeout_sec: float = 5.0):
         self.adapter = adapter
         self.limiter = limiter
         self.size_steps = size_steps
+        self.fill_timeout_sec = fill_timeout_sec
         self._checkpoint: Callable[[str], Awaitable[None]] | None = None
 
     def set_checkpoint(self, callback: Callable[[str], Awaitable[None]]) -> None:
         self._checkpoint = callback
 
     async def __call__(self, symbol: str, side: str, qty: Decimal) -> HedgeExecution:
+        submitted_at = datetime.now(timezone.utc).isoformat()
         response = await self.limiter.submit(
             EndpointGroup.HEDGE, Priority.CRITICAL,
             lambda: self.adapter.market_order(
@@ -254,26 +262,77 @@ class GmoHedgeExecutor:
             raise RuntimeError("GMO hedge response had no order id")
         if self._checkpoint is not None:
             await self._checkpoint(order_id)
-        executions = await self.limiter.submit(
-            EndpointGroup.QUERY, Priority.CRITICAL, lambda: self.adapter.executions(order_id),
+        filled, notional, confirmed_at = await self._await_fills(
+            order_id, qty, timeout_sec=self.fill_timeout_sec,
         )
-        rows = executions.get("data", [])
-        filled = sum((Decimal(str(row.get("size", "0"))) for row in rows), Decimal("0"))
-        notional = sum((
-            Decimal(str(row.get("size", "0"))) * Decimal(str(row.get("price", "0"))) for row in rows
-        ), Decimal("0"))
-        return HedgeExecution(order_id=order_id, filled_qty=filled, filled_notional=notional)
+        return HedgeExecution(
+            order_id=order_id, filled_qty=filled, filled_notional=notional,
+            submitted_at=submitted_at, confirmed_at=confirmed_at,
+        )
 
     async def resolve(self, intent: HedgeIntent) -> HedgeExecution | None:
         if not intent.exchange_order_id:
             raise RuntimeError("GMO order id was not durably checkpointed")
-        executions = await self.limiter.submit(
-            EndpointGroup.QUERY, Priority.CRITICAL,
-            lambda: self.adapter.executions(intent.exchange_order_id),
+        filled, notional, confirmed_at = await self._await_fills(
+            intent.exchange_order_id, intent.qty, timeout_sec=self.fill_timeout_sec,
         )
-        rows = executions.get("data", [])
-        filled = sum((Decimal(str(row.get("size", "0"))) for row in rows), Decimal("0"))
-        notional = sum((
-            Decimal(str(row.get("size", "0"))) * Decimal(str(row.get("price", "0"))) for row in rows
-        ), Decimal("0"))
-        return HedgeExecution(intent.exchange_order_id, filled, notional)
+        return HedgeExecution(
+            intent.exchange_order_id, filled, notional,
+            submitted_at=intent.created_at, confirmed_at=confirmed_at,
+        )
+
+    async def _await_fills(self, order_id: str, expected: Decimal, *,
+                           timeout_sec: float = 5.0) -> tuple[Decimal, Decimal, str]:
+        deadline = asyncio.get_running_loop().time() + timeout_sec
+        last_error: Exception | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                payload = await self.limiter.submit(
+                    EndpointGroup.QUERY, Priority.CRITICAL,
+                    lambda: self.adapter.executions(order_id),
+                )
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(.15)
+                continue
+            rows = self._rows(payload)
+            filled = sum((Decimal(str(row.get("size", "0"))) for row in rows), Decimal("0"))
+            notional = sum((
+                Decimal(str(row.get("size", "0"))) * Decimal(str(row.get("price", "0")))
+                for row in rows
+            ), Decimal("0"))
+            confirmed_at = datetime.now(timezone.utc).isoformat()
+            if filled >= expected:
+                return filled, notional, confirmed_at
+            try:
+                status = await self._order_status(order_id)
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(.15)
+                continue
+            if status in ("EXECUTED", "CANCELED"):
+                return filled, notional, confirmed_at
+            await asyncio.sleep(.15)
+        detail = f"；最后查询错误：{last_error}" if last_error else ""
+        raise RuntimeError(f"GMO 对冲 {order_id} 成交量未在 {timeout_sec:g}s 内确认{detail}")
+
+    async def _order_status(self, order_id: str) -> str:
+        payload = await self.limiter.submit(
+            EndpointGroup.QUERY, Priority.CRITICAL,
+            lambda: self.adapter.order(order_id),
+        )
+        data = payload.get("data", payload)
+        if isinstance(data, dict):
+            rows = data.get("list", data.get("orders"))
+            if isinstance(rows, list):
+                data = rows[0] if rows else {}
+        elif isinstance(data, list):
+            data = data[0] if data else {}
+        return str(data.get("status", "")).upper() if isinstance(data, dict) else ""
+
+    @staticmethod
+    def _rows(payload: dict) -> list[dict]:
+        rows = payload.get("data", [])
+        if isinstance(rows, dict):
+            rows = rows.get("list", rows.get("executions", []))
+        return rows if isinstance(rows, list) else []

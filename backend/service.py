@@ -17,29 +17,35 @@ from .config import Credentials
 from .core import make_quotes, matched_trade, opposite_side, reconcile, validate_config
 from .engine.balance import BalanceCache
 from .engine.alerting import LarkWebhookNotifier
+from .engine.domain import EventType
 from .engine.events import EventBus
 from .engine.execution_gateway import ExecutionGateway
 from .engine.fill_tracker import BitTradePrivateWS, BitTradeRestFillSource, FillTracker
 from .engine.hedge_worker import GmoHedgeExecutor, HedgeWorker
-from .engine.market_feed import MarketFeed
+from .engine.market_feed import GmoPublicWS, MarketFeed
 from .engine.quote_engine import QuoteEngine, WorkingQuote
-from .engine.rate_limit import PriorityRateLimiter
+from .engine.rate_limit import EndpointGroup, Priority, PriorityRateLimiter
 from .engine.recovery import RecoveryCoordinator
 from .engine.risk import RiskGate, RiskLimits, RiskSnapshot
 from .engine.state_store import StateStore
 from .models import (
     AuditEvent, ClientFill, ConnectionState, ConnectionUpdate, HedgeFill, InstrumentRules, MarketTop,
-    MatchedTrade, Metrics, Pnl, SimulatedFillRequest, StrategyConfig, SymbolRuntime, SystemState, utc_now,
+    MatchedTrade, Metrics, Pnl, SimulatedFillRequest, StrategyConfig, SymbolRuntime, SystemState,
+    gmo_taker_bps, utc_now,
 )
 
 
 class TradingService:
     def __init__(self, config: StrategyConfig, mode: str = "simulation", credentials: Credentials | None = None,
                  gmo: GmoAdapter | None = None, bittrade: BitTradeAdapter | None = None,
-                 db_path: Path | str = Path("data/jarb.db")):
+                 db_path: Path | str = Path("data/jarb.db"),
+                 simulation_fill_interval_sec: float = 2.0):
+        base_asset = config.symbol.removesuffix("_JPY")
+        config = StrategyConfig.model_validate({
+            **config.model_dump(), "gmoFeeBps": gmo_taker_bps(base_asset),
+        })
         validate_config(config)
         credentials = credentials or Credentials()
-        base_asset = config.symbol.removesuffix("_JPY")
         self.started_ns = time.monotonic_ns()
         self.clients: dict[str, list[ClientFill]] = {}
         self.hedges: dict[str, list[HedgeFill]] = {}
@@ -73,6 +79,12 @@ class TradingService:
             self.bittrade, self.state_store, self.risk_gate, self.rate_limiter,
         )
         self.market_feed = MarketFeed(self.gmo, self.events)
+        self.gmo_market_ws_task: asyncio.Task | None = None
+        self._rest_market_fallback: set[str] = set()
+        self._bittrade_depth_cache: dict[str, tuple[float, Decimal, Decimal]] = {}
+        self._bittrade_depth_errors: set[str] = set()
+        self._simulation_fill_interval_sec = max(.1, simulation_fill_interval_sec)
+        self._simulation_fill_sequence = 0
         self.fill_tracker: FillTracker | None = None
         self.rest_fill_source: BitTradeRestFillSource | None = None
         self.hedge_worker: HedgeWorker | None = None
@@ -150,6 +162,7 @@ class TradingService:
             await self.disarm("strategy configuration changed", "operator")
         requested_symbols = patch.pop("symbols", None)
         legacy_symbol = patch.pop("symbol", None)
+        patch.pop("gmoFeeBps", None)  # GMO taker fee is derived per base asset, never globally overridden.
         if requested_symbols is None and legacy_symbol is not None:
             requested_symbols = [legacy_symbol]
         target_symbols = self.state.activeSymbols if requested_symbols is None else list(dict.fromkeys(
@@ -176,7 +189,18 @@ class TradingService:
             raise ValueError(f"以下币种仍有未对冲仓位，不能停用：{', '.join(exposed)}")
 
         template = self.state.config.model_copy(update=patch)
-        validate_config(StrategyConfig.model_validate(template.model_dump()))
+        runtime_configs: dict[str, StrategyConfig] = {}
+        for symbol in target_symbols:
+            instrument = rules[symbol]
+            runtime_config = StrategyConfig.model_validate({
+                **template.model_dump(),
+                "symbol": symbol,
+                "gmoFeeBps": gmo_taker_bps(instrument.baseAsset),
+                "maxQuoteSize": min(instrument.maxOrderSize, max(template.maxQuoteSize, instrument.minOrderSize)),
+                "deltaLimit": max(template.deltaLimit, instrument.minOrderSize),
+            })
+            validate_config(runtime_config)
+            runtime_configs[symbol] = runtime_config
         new_symbols = [symbol for symbol in target_symbols if symbol not in self.state.symbolStates]
         try:
             markets = await asyncio.gather(*(self.gmo.ticker(rules[symbol].baseAsset) for symbol in new_symbols))
@@ -188,12 +212,7 @@ class TradingService:
             next_states: dict[str, SymbolRuntime] = {}
             for symbol in target_symbols:
                 instrument = rules[symbol]
-                runtime_config = StrategyConfig.model_validate({
-                    **template.model_dump(),
-                    "symbol": symbol,
-                    "maxQuoteSize": min(instrument.maxOrderSize, max(template.maxQuoteSize, instrument.minOrderSize)),
-                    "deltaLimit": max(template.deltaLimit, instrument.minOrderSize),
-                })
+                runtime_config = runtime_configs[symbol]
                 existing = self.state.symbolStates.get(symbol)
                 if existing:
                     existing.instrument = instrument
@@ -412,6 +431,12 @@ class TradingService:
             runtime.trades = runtime.trades[:50]
             self._recalculate(symbol)
             self._sync_primary()
+        await self._record(
+            "info", "quote.simulated",
+            f"BitTrade 模拟挂单成交：{client.side} {size} {runtime.instrument.baseAsset} @ ¥{client.price:,.3f}",
+            {"orderId": client.orderId, "clientFillId": client.id, "symbol": symbol,
+             "side": client.side, "price": client.price, "size": size},
+        )
         await self._record("info", "client.fill", f"BitTrade 本公司{'买入' if client.side == 'BUY' else '卖出'} {size} {runtime.instrument.baseAsset}", {"clientFillId": client.id, "symbol": symbol})
         await self._record("info", "hedge.filled", f"GMO 反向对冲完成，延迟 {latency_ms} ms", {"hedgeFillId": hedge.id, "clientFillId": client.id})
         self._publish()
@@ -431,40 +456,140 @@ class TradingService:
                 } for symbol, runtime in self.state.symbolStates.items()}}
 
     async def _run(self) -> None:
-        while True:
-            refresh_ms = min(runtime.config.quoteRefreshMs for runtime in self.state.symbolStates.values())
-            await asyncio.sleep(refresh_ms / 1000)
-            if self.state.mode == "online":
+        queue = self.events.open_queue(EventType.MARKET)
+        loop = asyncio.get_running_loop()
+        next_simulation = loop.time()
+        next_simulated_fill = loop.time() + min(.5, self._simulation_fill_interval_sec)
+        last_watchdog = loop.time()
+        try:
+            while True:
+                auto_fill: SimulatedFillRequest | None = None
                 try:
-                    await self._refresh_online_market()
-                except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-                    message = self._safe_error(exc)
-                    was_error = self.state.connection.lastError == message
-                    self.state.connection = self._connection_state("error", message)
-                    if not was_error:
-                        await self._record("warning", "market.disconnected", f"GMO 行情连接异常：{message}")
-            else:
+                    await asyncio.wait_for(queue.get(), timeout=1.0)
+                    while not queue.empty():
+                        queue.get_nowait()
+                except TimeoutError:
+                    pass
+                if self.state.mode == "online":
+                    recovered: list[str] = []
+                    async with self.lock:
+                        for symbol, runtime in self.state.symbolStates.items():
+                            latest = self.market_feed.latest.get(symbol)
+                            if latest is None:
+                                continue
+                            runtime.market = latest
+                            if self.state.running:
+                                runtime.quotes = self._timed_quotes(latest, runtime.config, runtime.instrument)
+                            if self.market_feed.latest_transport.get(symbol) == "ws" \
+                                    and symbol in self._rest_market_fallback:
+                                self._rest_market_fallback.discard(symbol)
+                                recovered.append(symbol)
+                        if self.market_feed.latest:
+                            self.state.connection = self._connection_state("connected")
+                    for symbol in recovered:
+                        await self._record("info", "market.ws.recovered", f"{symbol} 已恢复 GMO WebSocket 行情")
+                    if loop.time() - last_watchdog >= 5.0:
+                        last_watchdog = loop.time()
+                        await self._market_watchdog()
+                elif loop.time() >= next_simulation:
+                    refresh_ms = min(runtime.config.quoteRefreshMs for runtime in self.state.symbolStates.values())
+                    next_simulation = loop.time() + refresh_ms / 1000
+                    async with self.lock:
+                        for runtime in self.state.symbolStates.values():
+                            mid = (runtime.market.bid + runtime.market.ask) / 2
+                            move = (random.random() - 0.5) * mid * .0003
+                            half = max(runtime.instrument.priceTick, mid * (.0003 + random.random() * .00008))
+                            bid = self._floor_price(mid + move - half, runtime.instrument.priceTick)
+                            ask = self._ceil_price(mid + move + half, runtime.instrument.priceTick)
+                            depth_floor = runtime.instrument.minOrderSize
+                            depth_cap = max(
+                                depth_floor, min(runtime.instrument.maxOrderSize, runtime.config.maxQuoteSize * 4),
+                            )
+                            runtime.market = runtime.market.model_copy(update={
+                                "bid": bid, "ask": ask,
+                                "bidSize": self._floor_size(
+                                    depth_floor + random.random() * (depth_cap - depth_floor),
+                                    runtime.instrument.sizeStep,
+                                ),
+                                "askSize": self._floor_size(
+                                    depth_floor + random.random() * (depth_cap - depth_floor),
+                                    runtime.instrument.sizeStep,
+                                ),
+                                "timestamp": utc_now(),
+                            })
+                            if self.state.running:
+                                runtime.quotes = self._timed_quotes(
+                                    runtime.market, runtime.config, runtime.instrument,
+                                )
+                    if loop.time() >= next_simulated_fill:
+                        next_simulated_fill = loop.time() + self._simulation_fill_interval_sec
+                        auto_fill = self._next_simulated_fill()
+                if auto_fill is not None:
+                    try:
+                        await self.simulate_fill(auto_fill)
+                    except ValueError:
+                        pass
                 async with self.lock:
-                    for runtime in self.state.symbolStates.values():
-                        mid = (runtime.market.bid + runtime.market.ask) / 2
-                        move = (random.random() - 0.5) * mid * .0003
-                        half = max(runtime.instrument.priceTick, mid * (.0003 + random.random() * .00008))
-                        bid = self._floor_price(mid + move - half, runtime.instrument.priceTick)
-                        ask = self._ceil_price(mid + move + half, runtime.instrument.priceTick)
-                        depth_floor = runtime.instrument.minOrderSize
-                        depth_cap = max(depth_floor, min(runtime.instrument.maxOrderSize, runtime.config.maxQuoteSize * 4))
-                        runtime.market = runtime.market.model_copy(update={"bid": bid, "ask": ask,
-                            "bidSize": self._floor_size(depth_floor + random.random() * (depth_cap - depth_floor), runtime.instrument.sizeStep),
-                            "askSize": self._floor_size(depth_floor + random.random() * (depth_cap - depth_floor), runtime.instrument.sizeStep),
-                            "timestamp": utc_now()})
-                        if self.state.running:
-                            runtime.quotes = self._timed_quotes(runtime.market, runtime.config, runtime.instrument)
-            async with self.lock:
-                self.state.metrics.uptimeSec = int((time.monotonic_ns() - self.started_ns) / 1_000_000_000)
-                self._sync_primary()
-            await self._enforce_risk()
-            await self._run_live_quotes()
-            self._publish()
+                    self.state.metrics.uptimeSec = int(
+                        (time.monotonic_ns() - self.started_ns) / 1_000_000_000
+                    )
+                    self._sync_primary()
+                await self._enforce_risk()
+                await self._run_live_quotes()
+                self._publish()
+        finally:
+            self.events.close_queue(EventType.MARKET, queue)
+
+    def _next_simulated_fill(self) -> SimulatedFillRequest | None:
+        candidates: list[tuple[str, SymbolRuntime]] = []
+        for symbol in self.state.activeSymbols:
+            runtime = self.state.symbolStates[symbol]
+            if runtime.quotes and not self.balance_cache.pair_blockers(
+                runtime.instrument.baseAsset, require_actual=False,
+            ):
+                candidates.append((symbol, runtime))
+        if not candidates or not self.state.running or self.state.killSwitch:
+            return None
+        symbol, runtime = candidates[self._simulation_fill_sequence % len(candidates)]
+        side = "BUY" if (self._simulation_fill_sequence // len(candidates)) % 2 == 0 else "SELL"
+        self._simulation_fill_sequence += 1
+        quote = next((item for item in runtime.quotes if item.side == side), None)
+        if quote is None:
+            return None
+        target = max(runtime.instrument.minOrderSize, runtime.config.maxQuoteSize * .2)
+        size = self._floor_size(min(quote.size, target), runtime.instrument.sizeStep)
+        if size < runtime.instrument.minOrderSize:
+            return None
+        return SimulatedFillRequest(symbol=symbol, side=side, size=size, role="maker")
+
+    async def _market_watchdog(self) -> None:
+        fallback: dict[str, str] = {}
+        newly_stale: list[tuple[str, int]] = []
+        for symbol, runtime in self.state.symbolStates.items():
+            age = self.market_feed.age_ms(symbol)
+            if age > runtime.config.staleMarketMs or symbol in self._rest_market_fallback:
+                fallback[symbol] = runtime.instrument.baseAsset
+                if symbol not in self._rest_market_fallback:
+                    self._rest_market_fallback.add(symbol)
+                    newly_stale.append((symbol, age))
+        for symbol, age in newly_stale:
+            message = f"{symbol} GMO WebSocket 行情陈旧（{age} ms），已切换 REST 看门狗"
+            await self._record("warning", "market.ws.stale", message)
+            try:
+                await self.notifier.send_once(f"market:{symbol}", message)
+            except Exception as exc:
+                await self.state_store.audit("alert.webhook.failed", "warning", self._safe_error(exc))
+        if not fallback:
+            return
+        try:
+            await self.market_feed.refresh(fallback)
+            self.state.connection = self._connection_state("connected")
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            message = self._safe_error(exc)
+            was_error = self.state.connection.lastError == message
+            self.state.connection = self._connection_state("error", message)
+            if not was_error:
+                await self._record("critical", "market.rest.failed", f"GMO REST 看门狗失败：{message}")
 
     async def _refresh_online_market(self) -> None:
         symbols = list(self.state.activeSymbols)
@@ -586,8 +711,8 @@ class TradingService:
         if not self._bittrade_configured() or not self.gmo.api_key or not self.gmo.secret_key:
             raise ValueError("BitTrade 与 GMO 私有 API 凭据必须全部配置")
         stale = [
-            runtime.instrument.symbol for runtime in self.state.symbolStates.values()
-            if self._market_age_ms(runtime.market.timestamp) > runtime.config.staleMarketMs
+            symbol for symbol, runtime in self.state.symbolStates.items()
+            if self.market_feed.age_ms(symbol) > runtime.config.staleMarketMs
         ]
         if stale:
             raise ValueError(f"行情已过期，不能 Arm：{', '.join(stale)}")
@@ -619,6 +744,12 @@ class TradingService:
         return self.risk_status()
 
     async def _start_live_components(self) -> None:
+        if self.state.mode == "online" and self.gmo_market_ws_task is None:
+            websocket = GmoPublicWS(
+                [runtime.instrument.baseAsset for runtime in self.state.symbolStates.values()],
+                self.market_feed,
+            )
+            self.gmo_market_ws_task = asyncio.create_task(websocket.run(), name="gmo-public-ws")
         if self.fill_tracker is not None or not self._bittrade_configured():
             return
         if not self.gmo.api_key or not self.gmo.secret_key:
@@ -655,6 +786,16 @@ class TradingService:
         await self.fill_tracker.start(websocket.stream())
 
     async def _stop_live_components(self) -> None:
+        if self.gmo_market_ws_task:
+            self.gmo_market_ws_task.cancel()
+            try:
+                await self.gmo_market_ws_task
+            except asyncio.CancelledError:
+                pass
+            self.gmo_market_ws_task = None
+        self._rest_market_fallback.clear()
+        self._bittrade_depth_cache.clear()
+        self._bittrade_depth_errors.clear()
         if self.fill_tracker:
             await self.fill_tracker.stop()
             self.fill_tracker = None
@@ -693,7 +834,7 @@ class TradingService:
     async def _enforce_risk(self) -> None:
         if self.state.mode != "online":
             return
-        ages = [self._market_age_ms(runtime.market.timestamp) for runtime in self.state.symbolStates.values()]
+        ages = [self.market_feed.age_ms(symbol) for symbol in self.state.symbolStates]
         max_age = max(ages, default=0)
         stale_limit = min(runtime.config.staleMarketMs for runtime in self.state.symbolStates.values())
         was_armed = self.risk_gate.armed
@@ -703,7 +844,10 @@ class TradingService:
         daily_volume = await self.state_store.daily_fill_volume(day)
         daily_pnl = await self.state_store.daily_realized_pnl(
             day, maker_fee_bps=Decimal(str(self.state.config.bittradeMakerFeeBps)),
-            hedge_fee_bps=Decimal(str(self.state.config.gmoFeeBps)),
+            hedge_fee_bps={
+                symbol: Decimal(str(runtime.config.gmoFeeBps))
+                for symbol, runtime in self.state.symbolStates.items()
+            },
         )
         hedge_failures, hedge_p95 = await self.state_store.hedge_health(day)
         allowed, reason = await self.risk_gate.evaluate(RiskSnapshot(
@@ -774,10 +918,37 @@ class TradingService:
                 return
         rows = await self.state_store.open_orders()
         uncertain = [row for row in rows if row["state"] not in ("OPEN", "PARTIAL")]
+        for row in uncertain:
+            if row.get("exchange_order_id"):
+                await self.execution_gateway.confirm(
+                    row["client_order_id"], row["exchange_order_id"],
+                )
+        rows = await self.state_store.open_orders()
+        uncertain = [row for row in rows if row["state"] not in ("OPEN", "PARTIAL")]
         if uncertain:
             await self.disarm(f"{len(uncertain)} orders require reconciliation", "system")
             return
         open_by_key = {(row["symbol"], row["side"]): row for row in rows}
+        symbols = list(self.state.symbolStates)
+        depth_results = await asyncio.gather(
+            *(self._bittrade_best(symbol) for symbol in symbols), return_exceptions=True,
+        )
+        bittrade_depth: dict[str, tuple[Decimal, Decimal]] = {}
+        for symbol, result in zip(symbols, depth_results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, Exception):
+                if symbol not in self._bittrade_depth_errors:
+                    self._bittrade_depth_errors.add(symbol)
+                    await self._record(
+                        "warning", "bittrade.depth.failed",
+                        f"{symbol} 无法确认 BitTrade 盘口，本轮跳过报价：{self._safe_error(result)}",
+                    )
+                continue
+            bittrade_depth[symbol] = result
+            if symbol in self._bittrade_depth_errors:
+                self._bittrade_depth_errors.discard(symbol)
+                await self._record("info", "bittrade.depth.recovered", f"{symbol} BitTrade 盘口已恢复")
         for symbol, runtime in self.state.symbolStates.items():
             blockers = self.balance_cache.pair_blockers(runtime.instrument.baseAsset, require_actual=True)
             if blockers:
@@ -785,6 +956,9 @@ class TradingService:
                 continue
             self.state.disabledSymbols.pop(symbol, None)
             targets = self._timed_quotes(runtime.market, runtime.config, runtime.instrument)
+            if symbol not in bittrade_depth:
+                continue
+            bittrade_best_bid, bittrade_best_ask = bittrade_depth[symbol]
             adjusted = []
             for quote in targets:
                 key = (symbol, quote.side)
@@ -806,6 +980,15 @@ class TradingService:
                         self._working_quotes.pop(key, None)
                     continue
                 adjusted_quote = quote.model_copy(update={"size": float(size)})
+                target_price = Decimal(str(adjusted_quote.price))
+                would_cross = (quote.side == "SELL" and target_price <= bittrade_best_bid) \
+                    or (quote.side == "BUY" and target_price >= bittrade_best_ask)
+                if would_cross:
+                    if current:
+                        await self.execution_gateway.cancel(current)
+                        open_by_key.pop(key, None)
+                    self._working_quotes.pop(key, None)
+                    continue
                 adjusted.append(adjusted_quote)
                 cached = self._working_quotes.get(key)
                 working = None
@@ -815,13 +998,12 @@ class TradingService:
                         remaining_qty=max(Decimal("0"), Decimal(current["qty"]) - Decimal(current["cumulative_filled"])),
                         reference_depth=cached.reference_depth if cached else depth,
                     )
-                target_price = Decimal(str(adjusted_quote.price))
                 if not self.quote_engine.should_requote(
                     working, target_price=target_price, target_qty=size, current_depth=depth,
                 ):
                     continue
                 snapshot = RiskSnapshot(
-                    market_age_ms=self._market_age_ms(runtime.market.timestamp),
+                    market_age_ms=self.market_feed.age_ms(symbol),
                     stale_market_ms=runtime.config.staleMarketMs,
                     daily_pnl_jpy=runtime.pnl.net,
                     abs_delta=abs(runtime.reconciliation.delta),
@@ -841,10 +1023,35 @@ class TradingService:
                         price=target_price, original_qty=size, remaining_qty=size, reference_depth=depth,
                     )
                     open_by_key[key] = result
+                elif result.get("last_error") == "post_only_reject":
+                    self._working_quotes.pop(key, None)
+                    open_by_key.pop(key, None)
+                    continue
                 else:
                     await self.disarm(f"quote entered {result['state']}; reconciliation required", "system")
                     return
             runtime.quotes = adjusted
+
+    async def _bittrade_best(self, symbol: str) -> tuple[Decimal, Decimal]:
+        cached = self._bittrade_depth_cache.get(symbol)
+        now = time.monotonic()
+        if cached and now - cached[0] < 1.0:
+            return cached[1], cached[2]
+        payload = await self.rate_limiter.submit(
+            EndpointGroup.QUERY, Priority.QUERY,
+            lambda: self.bittrade.depth(symbol),
+        )
+        data = payload.get("tick", payload.get("data", {}))
+        if isinstance(data, dict) and isinstance(data.get("tick"), dict):
+            data = data["tick"]
+        bids = data.get("bids", []) if isinstance(data, dict) else []
+        asks = data.get("asks", []) if isinstance(data, dict) else []
+        if not bids or not asks:
+            raise RuntimeError(f"BitTrade {symbol} depth had no best bid/ask")
+        bid = Decimal(str(bids[0][0] if isinstance(bids[0], list | tuple) else bids[0]["price"]))
+        ask = Decimal(str(asks[0][0] if isinstance(asks[0], list | tuple) else asks[0]["price"]))
+        self._bittrade_depth_cache[symbol] = (now, bid, ask)
+        return bid, ask
 
     async def _apply_local_maker_balance(self, fill) -> None:
         base_asset = fill.symbol.removesuffix("_JPY")
@@ -856,6 +1063,22 @@ class TradingService:
 
     async def _apply_local_hedge_balance(self, symbol: str, side: str, execution) -> None:
         base_asset = symbol.removesuffix("_JPY")
+        runtime = self.state.symbolStates.get(symbol)
+        if runtime is not None and execution.filled_qty > 0:
+            reference = Decimal(str(runtime.market.ask if side == "BUY" else runtime.market.bid))
+            actual = execution.filled_notional / execution.filled_qty
+            if reference > 0:
+                realized_bps = abs(actual - reference) / reference * Decimal("10000")
+                await self._record(
+                    "info", "hedge.slippage.realized",
+                    f"{symbol} GMO 实际对冲滑点 {realized_bps:.3f} bps",
+                    {
+                        "symbol": symbol, "side": side, "orderId": execution.order_id,
+                        "referencePrice": str(reference), "actualPrice": str(actual),
+                        "realizedBps": str(realized_bps),
+                        "submittedAt": execution.submitted_at, "confirmedAt": execution.confirmed_at,
+                    },
+                )
         if side == "BUY":
             asset, delta = "JPY", -execution.filled_notional
         else:
@@ -958,14 +1181,6 @@ class TradingService:
                 )
             except Exception as exc:
                 await self.state_store.audit("alert.webhook.failed", "warning", self._safe_error(exc))
-
-    @staticmethod
-    def _market_age_ms(timestamp: str) -> int:
-        try:
-            observed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-            return max(0, int((datetime.now(timezone.utc) - observed).total_seconds() * 1000))
-        except ValueError:
-            return 2 ** 31 - 1
 
     def _bittrade_configured(self) -> bool:
         return bool(self.bittrade.access_key and self.bittrade.secret_key and self.bittrade.account_id)

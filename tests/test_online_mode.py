@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from backend.models import ConnectionUpdate, MarketTop, SimulatedFillRequest, StrategyConfig
@@ -81,6 +83,29 @@ async def test_only_common_online_api_symbols_can_be_selected():
 
 
 @pytest.mark.asyncio
+async def test_runtime_uses_per_symbol_gmo_taker_fee():
+    class FeeGmo(FakeGmo):
+        async def symbols(self):
+            return await super().symbols() + [
+                {"symbol": "LTC", "minOrderSize": ".01", "maxOrderSize": "100",
+                 "sizeStep": ".01", "tickSize": ".1"},
+            ]
+
+    class FeeBittrade(FakeBittrade):
+        async def symbols(self):
+            return await super().symbols() + [
+                {"base-currency": "ltc", "quote-currency": "jpy", "state": "online",
+                 "api-trading": "enabled", "amount-precision": 2, "price-precision": 1,
+                 "limit-order-min-order-amt": .01, "limit-order-max-order-amt": 100},
+            ]
+
+    service = TradingService(StrategyConfig(), gmo=FeeGmo(), bittrade=FeeBittrade())
+    await service.configure({"symbols": ["BTC_JPY", "LTC_JPY"], "gmoFeeBps": 0})
+    assert service.state.symbolStates["BTC_JPY"].config.gmoFeeBps == 5
+    assert service.state.symbolStates["LTC_JPY"].config.gmoFeeBps == 9
+
+
+@pytest.mark.asyncio
 async def test_multiple_symbols_run_and_reconcile_independently():
     service = TradingService(StrategyConfig(), gmo=FakeGmo(), bittrade=FakeBittrade())
     await service.configure({"symbols": ["BTC_JPY", "ETH_JPY"]})
@@ -100,6 +125,26 @@ async def test_multiple_symbols_run_and_reconcile_independently():
     assert btc.reconciliation.delta == eth.reconciliation.delta == 0
     assert service.state.metrics.fillCount == 2
     assert set(service.export_reconciliation()["symbols"]) == {"BTC_JPY", "ETH_JPY"}
+
+
+@pytest.mark.asyncio
+async def test_simulation_mode_automatically_generates_orders_and_hedges(tmp_path):
+    service = TradingService(
+        StrategyConfig(), gmo=FakeGmo(), bittrade=FakeBittrade(),
+        db_path=tmp_path / "state.db", simulation_fill_interval_sec=.1,
+    )
+    await service.start()
+    try:
+        for _ in range(30):
+            if service.state.metrics.fillCount:
+                break
+            await asyncio.sleep(.05)
+        assert service.state.metrics.fillCount >= 1
+        assert service.state.trades
+        assert any(event.type == "quote.simulated" for event in service.state.events)
+        assert service.state.reconciliation.delta == 0
+    finally:
+        await service.stop()
 
 
 @pytest.mark.asyncio

@@ -57,3 +57,33 @@ async def test_order_json_uses_decimal_grid_without_float_tails():
     assert decimal_string(100, 1) == "100"
     assert captured["amount"] == "0.3"
     assert captured["price"] == "100.3"
+
+
+@pytest.mark.asyncio
+async def test_bittrade_public_depth_uses_market_depth_endpoint():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/market/depth"
+        assert request.url.params["symbol"] == "btcjpy"
+        assert request.url.params["type"] == "step0"
+        return httpx.Response(200, json={"status": "ok", "tick": {
+            "bids": [[100, 2]], "asks": [[101, 3]],
+        }})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        payload = await BitTradeAdapter(client=client).depth("BTC_JPY")
+    assert payload["tick"]["bids"][0][0] == 100
+
+
+@pytest.mark.asyncio
+async def test_gmo_order_status_uses_private_orders_endpoint():
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["orderId"] = request.url.params["orderId"]
+        return httpx.Response(200, json={"status": 0, "data": {"list": [{"status": "EXECUTED"}]}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        payload = await GmoAdapter("key", "secret", client).order("G-1")
+    assert captured == {"path": "/private/v1/orders", "orderId": "G-1"}
+    assert payload["data"]["list"][0]["status"] == "EXECUTED"
