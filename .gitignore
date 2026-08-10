@@ -9,6 +9,9 @@ __pycache__
 target
 data/*.jsonl
 data/*.json
+data/*.db
+data/*.db-shm
+data/*.db-wal
 *.log
 *.tsbuildinfo
 .DS_Store
