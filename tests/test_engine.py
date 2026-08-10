@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 from decimal import Decimal
 
 import pytest
@@ -10,10 +12,12 @@ from backend.engine.balance import BalanceCache, CachedBalance
 from backend.engine.alerting import LarkWebhookNotifier
 from backend.engine.domain import HedgeStatus, OrderState
 from backend.engine.events import EventBus
+from backend.adapters import ExchangeAPIError
 from backend.engine.execution_gateway import ExecutionGateway
-from backend.engine.hedge_worker import HedgeExecution, HedgeWorker
+from backend.engine.hedge_worker import GmoHedgeExecutor, HedgeExecution, HedgeWorker
+from backend.engine.market_feed import GmoPublicWS, MarketFeed
 from backend.engine.quote_engine import QuoteEngine, RequotePolicy, WorkingQuote
-from backend.engine.rate_limit import PriorityRateLimiter
+from backend.engine.rate_limit import EndpointGroup, Priority, PriorityRateLimiter
 from backend.engine.risk import RiskGate, RiskLimits, RiskSnapshot
 from backend.engine.state_store import StateStore
 
@@ -49,6 +53,32 @@ async def test_cumulative_fills_are_database_idempotent(tmp_path):
     assert old is None
     assert (await store.open_orders())[0]["cumulative_filled"] == "0.35"
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_state_store_migrates_existing_hedge_latency_origin_column(tmp_path):
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute("""
+        CREATE TABLE hedge_intents (
+            id TEXT PRIMARY KEY, client_fill_id INTEGER NOT NULL UNIQUE, symbol TEXT NOT NULL,
+            side TEXT NOT NULL, qty TEXT NOT NULL, filled_qty TEXT NOT NULL DEFAULT '0',
+            filled_notional TEXT NOT NULL DEFAULT '0', status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0,
+            exchange_order_id TEXT, last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    connection.commit()
+    connection.close()
+    store = StateStore(path)
+    await store.initialize()
+    await store.close()
+    connection = sqlite3.connect(path)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(hedge_intents)")}
+    connection.close()
+    assert "source_fill_at" in columns
 
 
 @pytest.mark.asyncio
@@ -187,6 +217,135 @@ async def test_gateway_cancel_before_place_and_monotonic_ids(tmp_path):
     assert first["client_order_id"].endswith("-1")
     assert second["client_order_id"].endswith("-2")
     assert venue.actions == [f"place:{first['client_order_id']}", "cancel:2", f"place:{second['client_order_id']}"]
+    await limiter.stop()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_dispatches_critical_request_while_place_is_slow():
+    limiter = PriorityRateLimiter()
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    async def slow_place():
+        slow_started.set()
+        await release_slow.wait()
+        return "place"
+
+    async def fast_hedge():
+        return "hedge"
+
+    place = asyncio.create_task(limiter.submit(EndpointGroup.PLACE, Priority.PLACE, slow_place))
+    await slow_started.wait()
+    hedge = asyncio.create_task(limiter.submit(EndpointGroup.HEDGE, Priority.CRITICAL, fast_hedge))
+    assert await asyncio.wait_for(hedge, timeout=.2) == "hedge"
+    release_slow.set()
+    assert await place == "place"
+    await limiter.stop()
+
+
+@pytest.mark.asyncio
+async def test_gmo_hedge_waits_for_delayed_execution_confirmation():
+    class FakeGmo:
+        def __init__(self):
+            self.market_orders = 0
+            self.execution_queries = 0
+
+        async def market_order(self, symbol, side, qty, size_step):
+            self.market_orders += 1
+            return {"status": 0, "data": {"orderId": "G-1"}}
+
+        async def executions(self, order_id):
+            self.execution_queries += 1
+            if self.execution_queries == 1:
+                return {"status": 0, "data": []}
+            return {"status": 0, "data": [{"size": "0.1", "price": "100"}]}
+
+        async def order(self, order_id):
+            return {"status": 0, "data": {"list": [{"status": "ORDERED"}]}}
+
+    adapter = FakeGmo()
+    limiter = PriorityRateLimiter()
+    executor = GmoHedgeExecutor(
+        adapter, limiter, {"BTC_JPY": Decimal("0.1")}, fill_timeout_sec=.5,
+    )
+    execution = await executor("BTC_JPY", "SELL", Decimal("0.1"))
+    assert adapter.market_orders == 1
+    assert adapter.execution_queries == 2
+    assert execution.filled_qty == Decimal("0.1")
+    assert execution.filled_notional == Decimal("10.0")
+    assert execution.submitted_at and execution.confirmed_at
+    await limiter.stop()
+
+
+@pytest.mark.asyncio
+async def test_gmo_public_ws_serializes_subscriptions_and_publishes_best_level(monkeypatch):
+    sent: list[dict] = []
+    delays: list[float] = []
+    block = asyncio.Event()
+
+    class FakeSocket:
+        async def send(self, raw):
+            sent.append(json.loads(raw))
+
+        def __aiter__(self):
+            return self.messages()
+
+        async def messages(self):
+            yield json.dumps({
+                "channel": "orderbooks", "symbol": "BTC", "timestamp": "2026-08-10T00:00:00Z",
+                "bids": [{"price": "100", "size": "2"}],
+                "asks": [{"price": "101", "size": "3"}],
+            })
+            await block.wait()
+
+    class FakeConnect:
+        async def __aenter__(self):
+            return FakeSocket()
+
+        async def __aexit__(self, *_):
+            return False
+
+    async def no_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("backend.engine.market_feed.websockets.connect", lambda *_, **__: FakeConnect())
+    monkeypatch.setattr("backend.engine.market_feed.asyncio.sleep", no_sleep)
+    events = EventBus()
+    feed = MarketFeed(object(), events)
+    queue = events.open_queue("market.updated")
+    task = asyncio.create_task(GmoPublicWS(["BTC", "ETH"], feed).run())
+    event = await asyncio.wait_for(queue.get(), timeout=.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [row["symbol"] for row in sent[:2]] == ["BTC", "ETH"]
+    assert delays[:2] == [1.1, 1.1]
+    assert event.payload.bid == 100
+    assert event.payload.askSize == 3
+    assert feed.latest_transport["BTC_JPY"] == "ws"
+
+
+@pytest.mark.asyncio
+async def test_post_only_reject_is_classified_without_unknown_state(tmp_path):
+    class RejectingVenue(FakeMakerVenue):
+        async def place_quote(self, *args, **kwargs):
+            raise ExchangeAPIError("BitTrade", "order would immediately match", code="maker-reject")
+
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    risk = RiskGate(store, confirmation_phrase="ARM", kill_sentinel=tmp_path / "KILL")
+    await risk.restore()
+    await risk.mark_recovery_complete()
+    await risk.arm("ARM", "tester")
+    limiter = PriorityRateLimiter()
+    gateway = ExecutionGateway(RejectingVenue(), store, risk, limiter)
+    result = await gateway.place(
+        symbol="BTC_JPY", side="SELL", qty=Decimal("0.1"), price=Decimal("100"),
+        size_step=Decimal("0.1"), price_tick=Decimal("1"), snapshot=RiskSnapshot(),
+    )
+    assert result["state"] == "FAILED"
+    assert result["last_error"] == "post_only_reject"
     await limiter.stop()
     await store.close()
 

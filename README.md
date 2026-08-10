@@ -5,7 +5,8 @@ Python 异步交易编排 + Rust 核心计算模块。系统依据《流动性�
 ## 架构
 
 ```text
-GMO MarketFeed ─┐
+GMO Public WS ──┐
+REST 看门狗 5s ─┤
 BalanceCache ────┼→ QuoteEngine → ExecutionGateway → BitTrade
 RiskGate ────────┘                   │
                                     ↓
@@ -20,24 +21,29 @@ BitTrade 私有 WS → FillTracker → HedgeWorker → GMO FAK
 
 - `BitTrade Ask = GMO Ask × (1 + spread)`；`BitTrade Bid = GMO Bid × (1 - spread)`。
 - 挂单量不超过 GMO 最优价深度与策略上限。
-- Maker 场景下，价差必须高于 BitTrade Maker 费率 + GMO 手续费 + 预期滑点；Maker 费率支持正成本或负返佣。
+- Maker 场景下，每个币种的价差必须高于 BitTrade Maker 费率 + GMO Taker 手续费 + 预期滑点；Maker 费率支持正成本或负返佣。
 - 客户成交与 GMO 反向成交以 ID 关联，记录价格、数量、费用和延迟。
 - `Σ BitTrade signed qty + Σ GMO signed qty = Delta`。
 - Delta 阈值、暂停报价、紧急停止和对冲延迟监控。
 - Rust 核心计算 P99 在线采样。
 - JSONL 审计留痕和 JSON 日结导出。
+- 模拟模式默认约每 2 秒轮换一个已启用币种和买卖方向，自动生成 BitTrade 模拟挂单成交、GMO 反向对冲、PnL、Delta、延迟与审计数据；暂停、Kill 或底仓不足时自动停止生成。
 - GMO HMAC 与 BitTrade Signature V2 异步 API 适配器。
-- 可从控制台切换模拟/线上模式；线上模式使用 GMO 实时公开行情。
+- 可从控制台切换模拟/线上模式；线上模式以 GMO Public WebSocket `orderbooks` 全量快照为主行情，最多 8 个订阅按 1.1 秒间隔串行发送以规避 `ERR-5003`。
+- REST orderbook 保留为 5 秒看门狗；WebSocket 行情超过默认 800 ms 即停报价，陈旧或断线时切换 REST 并发送 Lark/飞书告警。
 - 可在设置抽屉配置或清除 GMO、BitTrade API Key，状态与日志只显示脱敏提示。
 - 币种选择来自 GMO 与 BitTrade 公共交易规则的实时交集，只保留双方均在线且开放 API 交易的 JPY 现货币种。
 - 自动合并双方最小/最大下单量、数量步长与价格步长；Rust 核心支持小数日元报价。
 - 最多可同时启用 8 个币种；每个币种独立维护行情、报价、仓位、Delta、成交与 P&amp;L，并在同一异步循环中并发刷新。
 - 持久化订单状态机：`NEW → PLACING → OPEN/PARTIAL → CANCELING → CANCELED/FILLED`；网络结果不确定时进入 `UNKNOWN`，必须查询确认。
 - 成交以数据库唯一键 `(order_id, trade_id)` 去重，并使用交易所累计成交量减去已记录累计量计算对冲差额。
-- 对冲意图在 GMO 下单前落库；GMO FAK 部分成交会把剩余数量退回重试，碎片超过 3 秒仍低于最小量会升级告警并自动 Disarm。
-- 按 endpoint 分组的令牌桶和优先队列保证“对冲 / kill / 撤单”优先于挂单和查询；429 使用指数退避。
+- 对冲意图在 GMO 下单前落库；GMO FAK 下单后轮询 executions 与订单终态，成交确认超时会抛错并进入重试/升级，避免因结算延迟把空结果误判成零成交后立刻重复下单。
+- 对冲延迟按“BitTrade 成交发生 → GMO executions 确认”记录，真实成交滑点写入审计，P95 直接进入自动 Disarm 风控。
+- 按 endpoint 分组的令牌桶和优先队列保证“对冲 / kill / 撤单”优先于挂单和查询；请求获得令牌后并发派发，慢查询不会串行阻塞对冲；429 使用指数退避。
 - 余额每 10 秒与两家交易所对齐，成交后保守地本地扣减；可挂量取策略上限、GMO 对侧深度、BitTrade 余额和 GMO 对冲余额的最小值，再乘 0.7 安全系数。
-- 报价只有价格偏离、深度变化或剩余量达到阈值才重挂，并严格执行先撤单确认、后用新 `client_order_id` 挂单。
+- 报价只有价格偏离、深度变化或剩余量达到阈值才重挂，并严格执行先撤单确认、后用新 `client_order_id` 挂单。撤单确认采用最长 10 秒退避轮询，`UNKNOWN` 会先主动查询对账再决定是否 Disarm。
+- 报价前读取 BitTrade `/market/depth`；会穿越 BitTrade 当前最优价的方向直接跳过。post-only 拒单只放弃该侧并等待下轮重算，其他下单错误仍会 Disarm。
+- GMO 对冲费率按基础币自动设置：BTC/ETH/XRP/DAI 为 5 bps，其余为 9 bps；每个币种单独执行盈利下限校验。默认 `SPREAD_BPS=25`。
 - BitTrade 与 GMO 可分别配置 JPY 和每个基础币的策略底仓额度；任一币对的四项底仓或实际余额有一项为 0，整对禁止做市和对冲并撤销该币对挂单。
 - 支持 Lark/飞书 Bot Webhook 底仓报警；相同故障默认 5 分钟内只推送一次，Webhook 仅保存在本机 SQLite，接口只返回脱敏提示。
 
@@ -63,6 +69,9 @@ BITTRADE_ACCESS_KEY=...
 BITTRADE_SECRET_KEY=...
 BITTRADE_ACCOUNT_ID=...
 BITTRADE_MAKER_FEE_BPS=0
+SPREAD_BPS=25
+EXPECTED_SLIPPAGE_BPS=1.5
+STALE_MARKET_MS=800
 TRADING_MODE=online
 ARM_CONFIRMATION_PHRASE="ARM JARB LIVE"
 KILL_SENTINEL=data/KILL
@@ -70,7 +79,7 @@ KILL_SENTINEL=data/KILL
 
 通过界面填写的密钥只保存在 FastAPI 进程内存中，服务重启后会清除。完整密钥不会进入 SSE 状态、接口响应或审计日志；响应只包含“是否已配置”和 Key 末四位提示。
 
-`BITTRADE_MAKER_FEE_BPS` 和设置界面的 Maker 费率使用 bps：正数表示交易成本，负数表示返佣。订单数量与价格在适配器边界使用 `Decimal` 按共同 step/tick 对齐后再序列化，避免二进制浮点尾数进入交易所请求。
+`BITTRADE_MAKER_FEE_BPS` 和设置界面的 Maker 费率使用 bps：正数表示交易成本，负数表示返佣，必须按账户实际 VIP 等级填写。GMO Taker 费率由币种自动决定，不能用一个全局值覆盖。`expectedSlippageBps` 应根据审计中的真实滑点分布定期校准（建议取包含行情漂移后的 P90）。订单数量与价格在适配器边界使用 `Decimal` 按共同 step/tick 对齐后再序列化，避免二进制浮点尾数进入交易所请求。
 
 ## 测试与性能基准
 
