@@ -16,7 +16,7 @@ fn side_sign(side: &str) -> PyResult<i64> {
 fn validate_profitability(spread_bps: f64, fee_bps: f64, slippage_bps: f64) -> PyResult<f64> {
     let floor = spread_bps - fee_bps - slippage_bps;
     if !floor.is_finite() || floor <= 0.0 {
-        return Err(PyValueError::new_err("价差必须高于 GMO 手续费与预期滑点之和"));
+        return Err(PyValueError::new_err("价差必须高于 BitTrade Maker 费率、GMO 手续费与预期滑点之和"));
     }
     Ok(floor)
 }

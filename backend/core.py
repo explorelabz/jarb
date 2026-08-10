@@ -14,7 +14,9 @@ if TYPE_CHECKING:
 
 
 def validate_config(config: StrategyConfig) -> float:
-    return native.validate_profitability(config.spreadBps, config.gmoFeeBps, config.expectedSlippageBps)
+    return native.validate_profitability(
+        config.spreadBps, config.gmoFeeBps + config.bittradeMakerFeeBps, config.expectedSlippageBps
+    )
 
 
 def make_quotes(market: MarketTop, config: StrategyConfig, price_tick: float = 1) -> list[QuoteLevel]:

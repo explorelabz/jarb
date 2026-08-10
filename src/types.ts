@@ -1,5 +1,21 @@
 export type Side = 'BUY' | 'SELL'
 
+export interface RiskStatus {
+  armed: boolean
+  armedUntil: number
+  recoveryComplete: boolean
+  killed: boolean
+  reason: string | null
+}
+
+export interface InventoryState {
+  bittrade: Record<string, number>
+  gmo: Record<string, number>
+  webhookConfigured: boolean
+  webhookHint: string | null
+  disabledSymbols: Record<string, string[]>
+}
+
 export interface InstrumentRules {
   symbol: string
   baseAsset: string
@@ -19,6 +35,8 @@ export interface SymbolRuntime {
   reconciliation: SystemState['reconciliation']
   pnl: SystemState['pnl']
   trades: SystemState['trades']
+  fillCount: number
+  hedgeP95Ms: number
 }
 
 export interface SystemState {
@@ -38,7 +56,7 @@ export interface SystemState {
   }>
   events: Array<{ id: string; timestamp: string; level: 'info' | 'warning' | 'critical'; type: string; message: string }>
   config: {
-    symbol: string; spreadBps: number; gmoFeeBps: number; expectedSlippageBps: number;
+    symbol: string; spreadBps: number; bittradeMakerFeeBps: number; gmoFeeBps: number; expectedSlippageBps: number;
     maxQuoteSize: number; deltaLimit: number; maxHedgeLatencyMs: number; staleMarketMs: number
   }
   connection: {
@@ -50,4 +68,5 @@ export interface SystemState {
   instrument: InstrumentRules
   activeSymbols: string[]
   symbolStates: Record<string, SymbolRuntime>
+  disabledSymbols: Record<string, string[]>
 }

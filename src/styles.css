@@ -176,6 +176,12 @@ footer button { margin-left: auto; border: 0; background: transparent; color: #7
 .settings-title b { font-size: 11px; font-weight: 600; color: #d2d8d5; }
 .settings-title small { color: #68726d; font: 400 9px Geist Mono, monospace; }
 .settings-title em { color: var(--accent); font: normal 500 10px Geist Mono, monospace; }
+.inventory-grid { display: grid; grid-template-columns: 62px 1fr 1fr; gap: 8px; align-items: center; margin-bottom: 8px; }
+.inventory-grid > span { color: #c7cfcb; font: 600 10px Geist Mono, monospace; }
+.inventory-grid input { width: 100%; min-width: 0; }
+.inventory-head { margin-bottom: 10px; color: #69736e; font: 500 9px Geist Mono, monospace; }
+.inventory-head b { font-weight: 500; }
+.inventory-section > label { margin-top: 16px; }
 .connection-dot { width: 7px; height: 7px; margin-top: 4px; border-radius: 50%; background: #626b67; }
 .connection-dot.connected { background: var(--accent); box-shadow: 0 0 0 4px rgba(108, 185, 149, .08); }
 .connection-dot.connecting { background: var(--warning); animation: breathe 1s infinite; }

@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import credentials, requested_mode, strategy_config
-from .models import ConnectionUpdate, ControlRequest, SimulatedFillRequest
+from .models import ArmRequest, ConnectionUpdate, ControlRequest, InventoryUpdate, SimulatedFillRequest
 from .service import TradingService
 
 service = TradingService(strategy_config, requested_mode, credentials)
@@ -77,6 +77,40 @@ async def control(request: ControlRequest):
         await service.control(request.action)
         return service.state
     except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/risk")
+async def risk_status():
+    return service.risk_status()
+
+
+@app.post("/api/risk/arm")
+async def arm(request: ArmRequest):
+    try:
+        return await service.arm(request.phrase, request.actor)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/risk/disarm")
+async def disarm():
+    return await service.disarm("operator requested disarm", "operator")
+
+
+@app.get("/api/inventory")
+async def inventory():
+    return service.inventory_summary()
+
+
+@app.patch("/api/inventory")
+async def update_inventory(update: InventoryUpdate):
+    try:
+        return await service.configure_inventory(
+            update.bittrade, update.gmo,
+            webhook_url=update.webhookUrl, clear_webhook=update.clearWebhook,
+        )
+    except (ValueError, TypeError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
 

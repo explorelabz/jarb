@@ -16,6 +16,7 @@ def number(name: str, default: float) -> float:
 strategy_config = StrategyConfig(
     symbol=os.getenv("SYMBOL", "BTC_JPY"),
     spreadBps=number("SPREAD_BPS", 10),
+    bittradeMakerFeeBps=number("BITTRADE_MAKER_FEE_BPS", 0),
     gmoFeeBps=number("GMO_FEE_BPS", 2),
     expectedSlippageBps=number("EXPECTED_SLIPPAGE_BPS", 1.5),
     maxQuoteSize=number("MAX_QUOTE_SIZE", 0.05),

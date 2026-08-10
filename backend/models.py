@@ -15,6 +15,7 @@ def utc_now() -> str:
 class StrategyConfig(BaseModel):
     symbol: str = "BTC_JPY"
     spreadBps: float = Field(10, gt=0)
+    bittradeMakerFeeBps: float = Field(0, ge=-100, le=100)
     gmoFeeBps: float = Field(2, ge=0)
     expectedSlippageBps: float = Field(1.5, ge=0)
     maxQuoteSize: float = Field(0.05, gt=0)
@@ -144,6 +145,8 @@ class SymbolRuntime(BaseModel):
     reconciliation: Reconciliation
     pnl: Pnl = Field(default_factory=Pnl)
     trades: list[MatchedTrade] = Field(default_factory=list)
+    fillCount: int = 0
+    hedgeP95Ms: int = 0
 
 
 class SystemState(BaseModel):
@@ -163,6 +166,7 @@ class SystemState(BaseModel):
     instrument: InstrumentRules
     activeSymbols: list[str] = Field(default_factory=list)
     symbolStates: dict[str, SymbolRuntime] = Field(default_factory=dict)
+    disabledSymbols: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class SimulatedFillRequest(BaseModel):
@@ -174,6 +178,18 @@ class SimulatedFillRequest(BaseModel):
 
 class ControlRequest(BaseModel):
     action: Literal["pause", "resume", "kill", "reset-kill"]
+
+
+class ArmRequest(BaseModel):
+    phrase: str = Field(min_length=1, max_length=128)
+    actor: str = Field(default="operator", min_length=1, max_length=128)
+
+
+class InventoryUpdate(BaseModel):
+    bittrade: dict[str, float] = Field(default_factory=dict)
+    gmo: dict[str, float] = Field(default_factory=dict)
+    webhookUrl: str | None = Field(default=None, max_length=1024)
+    clearWebhook: bool = False
 
 
 class ConnectionUpdate(BaseModel):

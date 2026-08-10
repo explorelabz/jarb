@@ -49,3 +49,9 @@ def test_reconciliation_uses_fixed_1e8_units():
 def test_maker_profitability_floor():
     with pytest.raises(ValueError, match="价差必须高于"):
         validate_config(config(spreadBps=3))
+
+
+def test_bittrade_maker_fee_is_included_in_profitability_floor():
+    with pytest.raises(ValueError, match="价差必须高于"):
+        validate_config(config(spreadBps=4, bittradeMakerFeeBps=1))
+    assert validate_config(config(spreadBps=4, bittradeMakerFeeBps=-1)) > 0

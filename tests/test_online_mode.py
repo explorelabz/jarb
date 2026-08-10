@@ -84,6 +84,10 @@ async def test_only_common_online_api_symbols_can_be_selected():
 async def test_multiple_symbols_run_and_reconcile_independently():
     service = TradingService(StrategyConfig(), gmo=FakeGmo(), bittrade=FakeBittrade())
     await service.configure({"symbols": ["BTC_JPY", "ETH_JPY"]})
+    await service.configure_inventory(
+        {"JPY": 1_000_000, "BTC": 1, "ETH": 10},
+        {"JPY": 1_000_000, "BTC": 1, "ETH": 10},
+    )
 
     assert service.state.activeSymbols == ["BTC_JPY", "ETH_JPY"]
     assert set(service.state.symbolStates) == {"BTC_JPY", "ETH_JPY"}
@@ -96,3 +100,35 @@ async def test_multiple_symbols_run_and_reconcile_independently():
     assert btc.reconciliation.delta == eth.reconciliation.delta == 0
     assert service.state.metrics.fillCount == 2
     assert set(service.export_reconciliation()["symbols"]) == {"BTC_JPY", "ETH_JPY"}
+
+
+@pytest.mark.asyncio
+async def test_zero_inventory_disables_entire_pair():
+    service = TradingService(StrategyConfig(), gmo=FakeGmo(), bittrade=FakeBittrade())
+    await service.configure_inventory(
+        {"JPY": 1_000_000, "BTC": 1},
+        {"JPY": 0, "BTC": 1},
+    )
+
+    assert service.state.disabledSymbols["BTC_JPY"] == ["gmo:JPY:底仓"]
+    with pytest.raises(ValueError, match="禁止交易"):
+        await service.simulate_fill(SimulatedFillRequest(symbol="BTC_JPY", side="SELL", size=.01))
+
+
+@pytest.mark.asyncio
+async def test_pnl_and_latency_use_full_history_beyond_display_limit():
+    service = TradingService(StrategyConfig(bittradeMakerFeeBps=1), gmo=FakeGmo(), bittrade=FakeBittrade())
+    for _ in range(60):
+        await service.simulate_fill(SimulatedFillRequest(symbol="BTC_JPY", side="SELL", size=.01))
+
+    runtime = service.state.symbolStates["BTC_JPY"]
+    full_history = service.matched_trades["BTC_JPY"]
+    latencies = sorted(trade.latencyMs for trade in full_history)
+    expected_p95 = latencies[min(len(latencies) - 1, int(len(latencies) * .95))]
+
+    assert len(runtime.trades) == 50
+    assert len(full_history) == runtime.fillCount == service.state.metrics.fillCount == 60
+    assert runtime.pnl.net == pytest.approx(sum(trade.netPnl for trade in full_history))
+    assert runtime.pnl.clientFees < 0
+    assert runtime.hedgeP95Ms == service.state.metrics.hedgeP95Ms == expected_p95
+    assert runtime.reconciliation.delta == 0
