@@ -63,6 +63,8 @@ async def security_headers(request: Request, call_next):
 async def sensitive_change(
     action: str, payload: bytes, actor: str, approval_id: str | None,
 ) -> JSONResponse | None:
+    if not require_dual_arm_approval:
+        return None
     if not approval_id:
         approval = sensitive_approvals.begin(action, payload, actor)
         await service.state_store.audit(
@@ -187,6 +189,8 @@ async def update_risk_limits(
 async def approve_sensitive_change(
     approval_id: str, actor: str = Depends(current_operator),
 ):
+    if not require_dual_arm_approval:
+        raise HTTPException(409, "当前为单操作员模式，无需双人审批")
     try:
         approval = sensitive_approvals.approve(approval_id, actor)
     except ValueError as exc:

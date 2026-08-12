@@ -66,11 +66,11 @@ npm run dev
 JARB_OPERATOR_TOKENS="alice=<至少32字符的随机token>,bob=<另一个至少32字符的随机token>"
 ```
 
-每个 Token 必须唯一绑定一个真实操作员。启用双人 Arm 时，第二次确认必须换用另一位操作员的 Token；请求体里的自报姓名不会被接受。
+每个 Token 必须唯一绑定一个真实操作员。`REQUIRE_DUAL_ARM_APPROVAL=false` 时，当前登录操作员可独立执行包括 Arm、修改交易所凭据和修改风控限额在内的全部操作；actor 仍会写入审计。设为 `true` 才会启用双人确认，请求体里的自报姓名不会被接受。
 
 Live 控制面不要直接暴露公网。后端应仅绑定 loopback，通过 SSH 隧道访问，或在 Nginx 前配置 mTLS。应用 CSP 只是纵深防御，不能替代网络隔离。
 
-修改交易所凭据或风控限额采用独立的双人审批：第一位操作员 PATCH 后收到 HTTP 202 和 `approvalId`；第二位操作员从自己的浏览器或 CLI 调用 `POST /api/approvals/<approvalId>/approve`；随后任一参与者在五分钟内携带 `X-JARB-Approval: <approvalId>` 重放完全相同的 PATCH。第二人的 Token 不应输入第一人的页面。
+启用双人确认时，修改交易所凭据或风控限额的第一位操作员 PATCH 后会收到 HTTP 202 和 `approvalId`；第二位操作员从自己的浏览器或 CLI 调用 `POST /api/approvals/<approvalId>/approve`；随后任一参与者在五分钟内携带 `X-JARB-Approval: <approvalId>` 重放完全相同的 PATCH。单操作员模式下 PATCH 会直接执行，不产生审批 ID。
 
 API Key 也可继续通过环境变量注入：
 
@@ -92,7 +92,7 @@ BITTRADE_QUEUE_BUDGET=0.05
 STALE_MARKET_MS=800
 TRADING_MODE=live
 ARM_CONFIRMATION_PHRASE="ARM JARB LIVE"
-REQUIRE_DUAL_ARM_APPROVAL=true
+REQUIRE_DUAL_ARM_APPROVAL=false
 KILL_SENTINEL=data/KILL
 GMO_TAKER_FEE_BPS_OVERRIDES="BTC=5,ETH=5,XRP=5,DAI=5"
 GMO_MAKER_FEE_BPS_OVERRIDES="BTC=-1,ETH=-1,XRP=-1,DAI=-1"
