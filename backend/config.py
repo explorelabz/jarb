@@ -51,7 +51,7 @@ strategy_config = StrategyConfig(
     maxQuoteSize=number("MAX_QUOTE_SIZE", 0.05),
     deltaLimit=number("DELTA_LIMIT", 0.005),
     maxHedgeLatencyMs=int(number("MAX_HEDGE_LATENCY_MS", 2500)),
-    staleMarketMs=int(number("STALE_MARKET_MS", 800)),
+    staleMarketMs=int(number("STALE_MARKET_MS", 3000)),
     quoteRefreshMs=int(number("QUOTE_REFRESH_MS", 1000)),
 )
 

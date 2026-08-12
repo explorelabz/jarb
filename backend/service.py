@@ -45,6 +45,7 @@ from .models import (
 ARM_TTL_BY_MODE = {"live": 3_600, "online": 3_600, "paper": 86_400, "simulation": 0}
 HEARTBEAT_INTERVAL_SEC = 600
 ARM_EXPIRY_WARNING_SEC = 300
+MARKET_WATCHDOG_INTERVAL_SEC = 2.0
 LEGACY_RANDOM_MATCH_FIELDS = {
     "autoMatch", "partialFills", "dustFills", "duplicateEvents", "outOfOrderEvents",
     "cancelAlreadyFilled", "cancelRaceFill", "autoMatchProbability", "dustProbability",
@@ -659,7 +660,7 @@ class TradingService:
                         self.state.connection = self._connection_state("connected")
                 for symbol in recovered:
                     await self._record("info", "market.ws.recovered", f"{symbol} 已恢复行情流")
-                if loop.time() - last_watchdog >= 5.0:
+                if loop.time() - last_watchdog >= MARKET_WATCHDOG_INTERVAL_SEC:
                     last_watchdog = loop.time()
                     await self._market_watchdog()
                 async with self.lock:
