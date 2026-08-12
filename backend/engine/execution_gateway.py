@@ -25,26 +25,41 @@ class MakerVenue(Protocol):
     async def open_orders(self, symbol: str | None = None) -> dict: ...
 
 
+class PaperOrderSink(Protocol):
+    async def on_place(self, client_order_id: str, symbol: str, side: str,
+                       price: Decimal, qty: Decimal): ...
+    async def on_activate(self, client_order_id: str) -> None: ...
+    async def on_cancel(self, client_order_id: str) -> None: ...
+    async def on_cancel_all(self) -> None: ...
+
+
 class ExecutionGateway:
     """The only component allowed to mutate maker orders."""
 
     def __init__(self, venue: MakerVenue, store: StateStore, risk: RiskGate,
-                 limiter: PriorityRateLimiter):
+                 limiter: PriorityRateLimiter, paper_engine: PaperOrderSink | None = None):
         self.venue = venue
         self.store = store
         self.risk = risk
         self.limiter = limiter
         self._replace_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._fill_reconciler: Callable[[dict], Awaitable[None]] | None = None
+        self.paper_engine = paper_engine
 
     def set_fill_reconciler(self, callback: Callable[[dict], Awaitable[None]] | None) -> None:
         self._fill_reconciler = callback
 
+    def set_paper_engine(self, engine: PaperOrderSink | None) -> None:
+        self.paper_engine = engine
+
     async def place(self, *, symbol: str, side: str, qty: Decimal, price: Decimal,
                     size_step: Decimal, price_tick: Decimal, snapshot: RiskSnapshot) -> dict:
-        allowed, reason = await self.risk.evaluate(RiskSnapshot(
-            **{**snapshot.__dict__, "order_notional_jpy": float(qty * price)},
-        ))
+        if self.paper_engine is not None:
+            allowed, reason = self.risk.armed, self.risk.last_reason
+        else:
+            allowed, reason = await self.risk.evaluate(RiskSnapshot(
+                **{**snapshot.__dict__, "order_notional_jpy": float(qty * price)},
+            ))
         if not allowed:
             raise RuntimeError(f"order rejected by RiskGate: {reason}")
         sequence = await self.store.next_sequence(f"order-seq:{symbol}:{side}")
@@ -53,6 +68,27 @@ class ExecutionGateway:
             client_order_id, symbol, side, qty, price, trading_mode=self.store.trading_mode,
         )
         await self.store.transition_order(client_order_id, OrderState.PLACING)
+        if self.paper_engine is not None:
+            exchange_order_id = f"PAPER-{client_order_id}"
+            try:
+                await self.paper_engine.on_place(client_order_id, symbol, side, price, qty)
+            except Exception as exc:
+                await self.paper_engine.on_cancel(client_order_id)
+                return await self.store.transition_order(
+                    client_order_id, OrderState.FAILED, error=str(exc)[:240],
+                )
+            row = await self.store.transition_order(
+                client_order_id, OrderState.OPEN, exchange_order_id=exchange_order_id,
+            )
+            try:
+                await self.paper_engine.on_activate(client_order_id)
+            except Exception as exc:
+                await self.paper_engine.on_cancel(client_order_id)
+                await self.store.transition_order(
+                    client_order_id, OrderState.CANCELING, error=str(exc)[:240],
+                )
+                return await self.store.transition_order(client_order_id, OrderState.CANCELED)
+            return row
         quote = DecimalQuote(side=side, price=price, size=qty, source_price=price)
         try:
             payload = await self.limiter.submit(
@@ -106,6 +142,19 @@ class ExecutionGateway:
                 return latest
             order = latest
             exchange_id = latest.get("exchange_order_id") or exchange_id
+        if self.paper_engine is not None:
+            try:
+                await self.store.transition_order(client_id, OrderState.CANCELING)
+            except ValueError:
+                latest = await self.store.order(client_id)
+                if latest is None or OrderState(latest["state"]) in (OrderState.FILLED, OrderState.CANCELED):
+                    return latest or order
+                raise
+            await self.paper_engine.on_cancel(client_id)
+            latest = await self.store.order(client_id)
+            if latest is not None and OrderState(latest["state"]) == OrderState.FILLED:
+                return latest
+            return await self.store.transition_order(client_id, OrderState.CANCELED)
         if not exchange_id:
             return await self.store.transition_order(
                 client_id, OrderState.UNKNOWN, error="cannot cancel without exchange order id",
@@ -125,6 +174,9 @@ class ExecutionGateway:
         return await self._wait_terminal(client_id, exchange_id)
 
     async def confirm(self, client_order_id: str, exchange_order_id: str) -> dict:
+        if self.paper_engine is not None:
+            row = await self.store.order(client_order_id)
+            return row or {"client_order_id": client_order_id, "state": OrderState.UNKNOWN}
         try:
             payload = await self.limiter.submit(
                 EndpointGroup.QUERY, Priority.QUERY, lambda: self.venue.order(exchange_order_id),
@@ -161,6 +213,24 @@ class ExecutionGateway:
 
     async def cancel_all(self, *, timeout_sec: float = 15.0) -> None:
         local = await self.store.open_orders()
+        if self.paper_engine is not None:
+            for row in local:
+                state = OrderState(row["state"])
+                if state in (OrderState.OPEN, OrderState.PARTIAL):
+                    await self.store.transition_order(row["client_order_id"], OrderState.CANCELING)
+                elif state == OrderState.PLACING:
+                    await self.store.transition_order(row["client_order_id"], OrderState.UNKNOWN)
+            await self.paper_engine.on_cancel_all()
+            for row in local:
+                latest = await self.store.order(row["client_order_id"])
+                if latest is None:
+                    continue
+                state = OrderState(latest["state"])
+                if state == OrderState.FILLED:
+                    continue
+                if state in (OrderState.CANCELING, OrderState.UNKNOWN):
+                    await self.store.transition_order(row["client_order_id"], OrderState.CANCELED)
+            return
         symbols = sorted({row["symbol"] for row in local}) or None
         await self.limiter.submit(
             EndpointGroup.KILL, Priority.CRITICAL,

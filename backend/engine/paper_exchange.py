@@ -164,6 +164,10 @@ class PaperBroker:
             for venue, assets in allocations.items()
         }
 
+    def set_market(self, market: MarketTop) -> None:
+        """Mirror an external market-data snapshot into the fake execution venues."""
+        self.markets[market.symbol] = market
+
     async def market_stream(self, bases: list[str], feed) -> None:
         selected = [base.upper() for base in bases]
         while True:
@@ -177,6 +181,12 @@ class PaperBroker:
                 market = self._market(base, next_mid)
                 self.markets[symbol] = market
                 await feed.update(market, transport="ws")
+            await self.match_open_orders()
+            await asyncio.sleep(.2)
+
+    async def match_loop(self) -> None:
+        """Keep fake fills running when market data comes from a real venue."""
+        while True:
             await self.match_open_orders()
             await asyncio.sleep(.2)
 
@@ -460,12 +470,30 @@ class FakeGmo:
         market = self.broker.markets[symbol]
         requested = Decimal(str(size))
         ratio = Decimal(str(self.broker.scenarios.gmoFillRatio)) if self.broker.scenarios.gmoPartialFak else Decimal("1")
-        filled = requested * ratio
-        filled = (filled / size_step).to_integral_value(rounding=ROUND_DOWN) * size_step
-        filled = min(requested, max(Decimal("0"), filled))
-        reference = Decimal(str(market.ask if side == "BUY" else market.bid))
-        slip = Decimal(str(self.broker.rng.uniform(0, .00015)))
-        price = reference * (Decimal("1") + slip if side == "BUY" else Decimal("1") - slip)
+        target = (requested * ratio / size_step).to_integral_value(rounding=ROUND_DOWN) * size_step
+        target = min(requested, max(Decimal("0"), target))
+        raw_levels = market.asks if side == "BUY" else market.bids
+        levels = [
+            (Decimal(str(level[0])), Decimal(str(level[1]))) for level in raw_levels
+            if len(level) >= 2 and Decimal(str(level[1])) > 0
+        ]
+        if not levels:
+            levels = [(Decimal(str(market.ask if side == "BUY" else market.bid)), target)]
+        filled = Decimal("0")
+        notional = Decimal("0")
+        last_price = Decimal("0")
+        for level_price, level_qty in levels:
+            take = min(level_qty, target - filled)
+            if take <= 0:
+                break
+            filled += take
+            notional += take * level_price
+            last_price = level_price
+        aligned_filled = (filled / size_step).to_integral_value(rounding=ROUND_DOWN) * size_step
+        if aligned_filled < filled:
+            notional -= (filled - aligned_filled) * last_price
+        filled = aligned_filled
+        price = notional / filled if filled > 0 else Decimal("0")
         delay_ms = self.broker.rng.randint(
             self.broker.scenarios.executionDelayMinMs, self.broker.scenarios.executionDelayMaxMs,
         ) if self.broker.scenarios.delayedExecutions else 0

@@ -6,8 +6,13 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from .state_store import StateStore
+
+
+class AlertNotifier(Protocol):
+    async def send(self, message: str) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -36,13 +41,15 @@ class RiskSnapshot:
 class RiskGate:
     def __init__(self, store: StateStore, limits: RiskLimits | None = None, *,
                  confirmation_phrase: str | None = None, kill_sentinel: Path | str | None = None,
-                 require_dual_approval: bool = False, approval_ttl_sec: int = 300):
+                 require_dual_approval: bool = False, approval_ttl_sec: int = 300,
+                 notifier: AlertNotifier | None = None):
         self.store = store
         self.limits = limits or RiskLimits()
         self.confirmation_phrase = confirmation_phrase if confirmation_phrase is not None else os.getenv("ARM_CONFIRMATION_PHRASE", "")
         self.kill_sentinel = Path(kill_sentinel or os.getenv("KILL_SENTINEL", "data/KILL"))
         self.require_dual_approval = require_dual_approval
         self.approval_ttl_sec = approval_ttl_sec
+        self.notifier = notifier
         self.pending_arm_actor: str | None = None
         self.pending_arm_until = 0.0
         self.armed_until = 0.0
@@ -115,6 +122,14 @@ class RiskGate:
             self.pending_arm_until = 0.0
             self.last_reason = reason
             await self._persist(f"disarmed: {reason}", actor)
+            if self.notifier:
+                try:
+                    await self.notifier.send(f"⚠️ JARB 已 DISARM：{reason}（操作者：{actor}）")
+                except Exception as exc:
+                    # A notification failure must never interfere with a safety disarm.
+                    await self.store.audit(
+                        "alert.webhook.failed", "warning", f"risk disarm alert: {str(exc)[:240]}", actor=actor,
+                    )
 
     async def kill(self, reason: str, actor: str = "system") -> None:
         async with self._lock:

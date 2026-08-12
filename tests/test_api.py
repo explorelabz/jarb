@@ -8,7 +8,7 @@ from backend.main import app
 
 
 @pytest.mark.asyncio
-async def test_health_and_simulated_hedge_close_delta():
+async def test_health_and_paper_mode_exposes_live_market_source():
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -32,25 +32,18 @@ async def test_health_and_simulated_hedge_close_delta():
             assert "gmo-secret-value" not in configured.text
             assert "bittrade-secret-value" not in (await client.get("/api/state")).text
 
-            scenarios = await client.patch("/api/paper/scenarios", json={"partialFills": True})
-            assert scenarios.status_code == 200
-            assert scenarios.json()["partialFills"] is True
-            exported = {}
-            for _ in range(80):
-                exported = (await client.get("/api/reconciliation/export")).json()
-                btc = exported["symbols"]["BTC_JPY"]
-                if btc["matchedTrades"] and exported["result"]["status"] == "matched":
-                    break
-                await asyncio.sleep(.1)
-            assert exported["result"]["delta"] == 0
-            assert exported["result"]["status"] == "matched"
+            state = (await client.get("/api/state")).json()
+            assert state["mode"] == "paper"
+            assert state["market"]["source"] == "GMO"
+            manual_fill = await client.post("/api/paper/fill", json={
+                "symbol": "BTC_JPY", "side": "BUY", "size": .001, "role": "maker",
+            })
+            assert manual_fill.status_code == 400
+            assert "禁止手工注入成交" in manual_fill.text
             order_csv = await client.get("/api/orders/export?format=csv&mode=paper")
             assert order_csv.status_code == 200
             assert "trading_mode,client_order_id" in order_csv.text
             assert "attachment; filename=jarb-orders-paper.csv" in order_csv.headers["content-disposition"]
-            order_json = await client.get("/api/orders/export?format=json&mode=all")
-            assert order_json.status_code == 200
-            assert order_json.json()["orders"]
 
             cleared = await client.patch("/api/connection", json={
                 "mode": "paper", "clearGmoCredentials": True, "clearBittradeCredentials": True,

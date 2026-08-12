@@ -24,6 +24,9 @@ from .engine.fill_tracker import BitTradePrivateWS, BitTradeRestFillSource, Fill
 from .engine.hedge_worker import GmoHedgeExecutor, HedgeExecution, HedgeWorker
 from .engine.market_feed import GmoPublicWS, MarketFeed
 from .engine.paper_exchange import FakeBitTrade, FakeGmo, PaperBroker, PaperScenarioConfig
+from .engine.paper_matcher import (
+    BitTradeDepthFeed, BitTradeTradeStream, PaperMatchingEngine, PublicTrade,
+)
 from .engine.quote_engine import QuoteEngine, WorkingQuote, target_price
 from .engine.rate_limit import EndpointGroup, Priority, PriorityRateLimiter
 from .engine.recovery import RecoveryCoordinator
@@ -37,6 +40,18 @@ from .models import (
 )
 
 
+# The public API accepts legacy online/simulation names, but service instances are
+# canonicalized to live/paper before this mapping is consumed.
+ARM_TTL_BY_MODE = {"live": 3_600, "online": 3_600, "paper": 86_400, "simulation": 0}
+HEARTBEAT_INTERVAL_SEC = 600
+ARM_EXPIRY_WARNING_SEC = 300
+LEGACY_RANDOM_MATCH_FIELDS = {
+    "autoMatch", "partialFills", "dustFills", "duplicateEvents", "outOfOrderEvents",
+    "cancelAlreadyFilled", "cancelRaceFill", "autoMatchProbability", "dustProbability",
+    "duplicateProbability", "outOfOrderProbability", "cancelRaceProbability",
+}
+
+
 class TradingService:
     def __init__(self, config: StrategyConfig, mode: str = "paper", credentials: Credentials | None = None,
                  gmo: GmoAdapter | None = None, bittrade: BitTradeAdapter | None = None,
@@ -47,7 +62,11 @@ class TradingService:
                  require_dual_arm_approval: bool = True,
                  market_stream_factory: Callable[[list[str], MarketFeed], Awaitable[None]] | None = None,
                  private_stream_factory: Callable[..., AsyncIterator] | None = None,
-                 paper_scenarios: PaperScenarioConfig | None = None):
+                 paper_scenarios: PaperScenarioConfig | None = None,
+                 market_gmo: GmoAdapter | None = None,
+                 market_bittrade: BitTradeAdapter | None = None,
+                 bittrade_depth_factory: Callable[[list[str]], BitTradeDepthFeed] | None = None,
+                 paper_trade_stream_factory: Callable[[list[str]], AsyncIterator[PublicTrade]] | None = None):
         mode = {"simulation": "paper", "online": "live"}.get(mode, mode)
         if mode not in {"paper", "live"}:
             raise ValueError("mode must be paper or live")
@@ -81,17 +100,27 @@ class TradingService:
         effective_limits = risk_limits or RiskLimits(
             max_abs_delta=config.deltaLimit, max_hedge_p95_ms=config.maxHedgeLatencyMs,
         )
+        effective_limits = replace(effective_limits, arm_ttl_sec=ARM_TTL_BY_MODE[mode])
+        self.notifier = LarkWebhookNotifier()
         self.risk_gate = RiskGate(
             self.state_store, effective_limits,
             confirmation_phrase="ARM JARB PAPER" if mode == "paper" else None,
             require_dual_approval=False if mode == "paper" else require_dual_arm_approval,
+            notifier=self.notifier,
         )
         self.lock = asyncio.Lock()
         self.subscribers: set[asyncio.Queue[str]] = set()
         self.task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
+        self._arm_expiry_warning_task: asyncio.Task | None = None
+        self._arm_expiry_warning_for = 0.0
         self.core_samples_us: list[float] = []
         self._symbol_cache: list[InstrumentRules] = []
         self._symbol_cache_at = 0.0
+        # Explicit execution adapters are generally test/dev seams and historically
+        # supplied both public data and execution. Preserve that contract unless
+        # callers explicitly provide separate market adapters.
+        injected_execution_adapters = gmo is not None or bittrade is not None
         self.paper_broker: PaperBroker | None = None
         if mode == "paper" and gmo is None and bittrade is None:
             self.paper_broker = PaperBroker(paper_scenarios)
@@ -102,8 +131,17 @@ class TradingService:
         self.gmo = gmo or GmoAdapter(credentials.gmo_api_key, credentials.gmo_secret_key, self._http_client)
         self.bittrade = bittrade or BitTradeAdapter(credentials.bittrade_access_key, credentials.bittrade_secret_key,
                                                     credentials.bittrade_account_id, self._http_client)
+        self._market_http_client: httpx.AsyncClient | None = None
+        if mode == "paper" and not injected_execution_adapters \
+                and market_gmo is None and market_bittrade is None:
+            # Paper uses public live books while all execution remains on FakeGmo/FakeBitTrade.
+            self._market_http_client = httpx.AsyncClient(timeout=3.0)
+            market_gmo = GmoAdapter(client=self._market_http_client)
+            market_bittrade = BitTradeAdapter(client=self._market_http_client)
+        self.market_gmo = market_gmo or self.gmo
+        self.market_bittrade = market_bittrade or self.bittrade
         self._market_stream_factory = market_stream_factory or (
-            (lambda bases, feed: self.gmo.market_stream(bases, feed)) if hasattr(self.gmo, "market_stream")
+            (lambda bases, feed: self.market_gmo.market_stream(bases, feed)) if hasattr(self.market_gmo, "market_stream")
             else (lambda bases, feed: GmoPublicWS(bases, feed).run())
         )
         self._private_stream_factory = private_stream_factory or (
@@ -112,7 +150,10 @@ class TradingService:
                 adapter, symbols, **callbacks,
             ).stream())
         )
-        self.notifier = LarkWebhookNotifier(self._http_client)
+        self._bittrade_depth_factory = bittrade_depth_factory or BitTradeDepthFeed
+        self._paper_trade_stream_factory = paper_trade_stream_factory or (
+            lambda symbols: BitTradeTradeStream(symbols).stream()
+        )
         self.inventory_allocations: dict[str, dict[str, Decimal]] = {
             "bittrade": {"JPY": Decimal("1000000"), base_asset: Decimal("1")},
             "gmo": {"JPY": Decimal("1000000"), base_asset: Decimal("1")},
@@ -121,8 +162,12 @@ class TradingService:
         self.execution_gateway = ExecutionGateway(
             self.bittrade, self.state_store, self.risk_gate, self.rate_limiter,
         )
-        self.market_feed = MarketFeed(self.gmo, self.events)
+        self.market_feed = MarketFeed(self.market_gmo, self.events)
         self.gmo_market_ws_task: asyncio.Task | None = None
+        self.bittrade_depth_feed: BitTradeDepthFeed | None = None
+        self.paper_engine: PaperMatchingEngine | None = None
+        self.paper_trade_task: asyncio.Task | None = None
+        self.paper_resync_task: asyncio.Task | None = None
         self._rest_market_fallback: set[str] = set()
         self._bittrade_depth_cache: dict[
             str, tuple[float, list[tuple[Decimal, Decimal]], list[tuple[Decimal, Decimal]]]
@@ -139,7 +184,7 @@ class TradingService:
         instrument = InstrumentRules(symbol=config.symbol, baseAsset=base_asset, minOrderSize=.0001,
                                      maxOrderSize=5, sizeStep=.0001, priceTick=1)
         market = MarketTop(symbol=config.symbol, bid=17_482_140, ask=17_493_860, bidSize=0.4382,
-                           askSize=0.3167, timestamp=utc_now(), source="SIM")
+                           askSize=0.3167, timestamp=utc_now(), source="GMO" if mode in {"paper", "live"} else "SIM")
         runtime = SymbolRuntime(instrument=instrument, config=config, market=market, quotes=make_quotes(market, config),
                                 reconciliation=reconcile(config.symbol, [], []))
         self.clients[config.symbol] = []
@@ -167,9 +212,11 @@ class TradingService:
             await RecoveryCoordinator(
                 self.state_store, self.risk_gate, gateway=self.execution_gateway,
                 gmo=self.gmo,
-                bittrade=self.bittrade if self._bittrade_configured() else None,
+                # Paper has no remote maker orders anymore; only durable local orders
+                # are canceled through the queue matcher during recovery.
+                bittrade=self.bittrade if self.places_real_orders and self._bittrade_configured() else None,
                 cancel_existing=True,
-                reconcile_fills=self._reconcile_unsettled if self.fill_tracker else None,
+                reconcile_fills=self._reconcile_unsettled if self.rest_fill_source else None,
             ).run()
             await self._refresh_live_projection()
             try:
@@ -182,6 +229,10 @@ class TradingService:
                 self.state.running = True
             await self._record("info", "system.started", f"策略以{'线上' if self.state.mode == 'live' else 'Paper'}模式启动")
             self.task = asyncio.create_task(self._run(), name="market-loop")
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="lark-heartbeat")
+            self._arm_expiry_warning_task = asyncio.create_task(
+                self._arm_expiry_warning_loop(), name="arm-expiry-warning",
+            )
 
     async def stop(self) -> None:
         if self.task:
@@ -191,6 +242,15 @@ class TradingService:
             except asyncio.CancelledError:
                 pass
             self.task = None
+        for attribute in ("_heartbeat_task", "_arm_expiry_warning_task"):
+            task = getattr(self, attribute)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, attribute, None)
         if self._projection_task is not None:
             self._projection_task.cancel()
             try:
@@ -204,8 +264,18 @@ class TradingService:
             await self.state_store.close()
             self._engine_ready = False
         await self.notifier.close()
+        if self._market_http_client is not None:
+            await self._market_http_client.aclose()
         if self._http_client is not None:
             await self._http_client.aclose()
+
+    @property
+    def uses_live_market(self) -> bool:
+        return self.state.mode in {"paper", "live"}
+
+    @property
+    def places_real_orders(self) -> bool:
+        return self.state.mode == "live"
 
     async def stream(self) -> AsyncIterator[str]:
         queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
@@ -218,7 +288,7 @@ class TradingService:
             self.subscribers.discard(queue)
 
     async def configure(self, patch: dict) -> None:
-        if self._engine_ready and self.risk_gate.armed:
+        if self.places_real_orders and self._engine_ready and self.risk_gate.armed:
             await self.disarm("strategy configuration changed", "operator")
         requested_symbols = patch.pop("symbols", None)
         legacy_symbol = patch.pop("symbol", None)
@@ -289,7 +359,7 @@ class TradingService:
             runtime_configs[symbol] = runtime_config
         new_symbols = [symbol for symbol in target_symbols if symbol not in self.state.symbolStates]
         try:
-            markets = await asyncio.gather(*(self.gmo.ticker(rules[symbol].baseAsset) for symbol in new_symbols))
+            markets = await asyncio.gather(*(self.market_gmo.ticker(rules[symbol].baseAsset) for symbol in new_symbols))
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
             raise ValueError(f"无法初始化新增币种行情：{self._safe_error(exc)}") from exc
         market_by_symbol = dict(zip(new_symbols, markets, strict=True))
@@ -306,7 +376,11 @@ class TradingService:
                     existing.quotes = self._timed_quotes(existing.market, runtime_config, instrument)
                     next_states[symbol] = existing
                 else:
-                    market = market_by_symbol[symbol].model_copy(update={"source": "GMO" if self.state.mode == "live" else "SIM"})
+                    market = market_by_symbol[symbol].model_copy(
+                        update={"source": "GMO" if self.uses_live_market else "SIM"},
+                    )
+                    if self.paper_broker is not None:
+                        self.paper_broker.set_market(market)
                     next_states[symbol] = SymbolRuntime(
                         instrument=instrument, config=runtime_config, market=market,
                         quotes=self._timed_quotes(market, runtime_config, instrument),
@@ -340,18 +414,21 @@ class TradingService:
         if self._engine_ready:
             await self._stop_live_components()
             await self._start_live_components()
-            await RecoveryCoordinator(
-                self.state_store, self.risk_gate, gateway=self.execution_gateway,
-                gmo=self.gmo, bittrade=self.bittrade if self._bittrade_configured() else None,
-                cancel_existing=True,
-                reconcile_fills=self._reconcile_unsettled if self.fill_tracker else None,
-            ).run()
+            if self.places_real_orders:
+                await RecoveryCoordinator(
+                    self.state_store, self.risk_gate, gateway=self.execution_gateway,
+                    gmo=self.gmo, bittrade=self.bittrade if self._bittrade_configured() else None,
+                    cancel_existing=True,
+                    reconcile_fills=self._reconcile_unsettled if self.rest_fill_source else None,
+                ).run()
         self._publish()
 
     async def common_symbols(self, force: bool = False) -> list[InstrumentRules]:
         if not force and self._symbol_cache and time.monotonic() - self._symbol_cache_at < 300:
             return self._symbol_cache
-        gmo_rows, bittrade_rows = await asyncio.gather(self.gmo.symbols(), self.bittrade.symbols())
+        gmo_rows, bittrade_rows = await asyncio.gather(
+            self.market_gmo.symbols(), self.market_bittrade.symbols(),
+        )
         gmo_spot = {
             str(row.get("symbol", "")).upper(): row for row in gmo_rows
             if row.get("symbol") and "_" not in str(row["symbol"])
@@ -427,7 +504,7 @@ class TradingService:
                     self.state_store, self.risk_gate, gateway=self.execution_gateway,
                     gmo=self.gmo, bittrade=self.bittrade if self._bittrade_configured() else None,
                     cancel_existing=True,
-                    reconcile_fills=self._reconcile_unsettled if self.fill_tracker else None,
+                    reconcile_fills=self._reconcile_unsettled if self.rest_fill_source else None,
                 ).run()
             await self._record("warning", "connection.live", "已连接真实账户，当前保持 DISARMED")
         else:
@@ -441,7 +518,17 @@ class TradingService:
     def paper_scenario_summary(self) -> dict:
         if self.paper_broker is None:
             raise ValueError("坏情况注入只在 Paper 模式可用")
-        return self.paper_broker.scenarios.model_dump()
+        matching = self.paper_engine.stats() if self.paper_engine is not None else {
+            "openOrders": 0, "throughFills": 0, "atLevelFills": 0,
+            "throughQty": "0", "atLevelQty": "0", "throughRatio": 0.0,
+            "publicTradesSeen": 0, "lastTradeTsMs": 0,
+        }
+        matching["publicDepth"] = self.bittrade_depth_feed.status() \
+            if self.bittrade_depth_feed is not None and hasattr(self.bittrade_depth_feed, "status") else {}
+        return {
+            **self.paper_broker.scenarios.model_dump(exclude=LEGACY_RANDOM_MATCH_FIELDS),
+            "matching": matching,
+        }
 
     async def configure_paper_scenarios(self, update: PaperScenarioUpdate) -> dict:
         if self.paper_broker is None:
@@ -450,7 +537,7 @@ class TradingService:
         if self._engine_ready:
             await self.state_store.set_state("paper.scenarios", result.model_dump())
         await self._record("warning", "paper.scenarios.updated", "Paper 撮合坏情况开关已更新", result.model_dump())
-        return result.model_dump()
+        return self.paper_scenario_summary()
 
     async def control(self, action: str) -> None:
         if action == "resume":
@@ -477,28 +564,16 @@ class TradingService:
                 await RecoveryCoordinator(
                     self.state_store, self.risk_gate, gateway=self.execution_gateway,
                     gmo=self.gmo,
-                    bittrade=self.bittrade if self._bittrade_configured() else None,
+                    bittrade=self.bittrade if self.places_real_orders and self._bittrade_configured() else None,
                     cancel_existing=True,
-                    reconcile_fills=self._reconcile_unsettled if self.fill_tracker else None,
+                    reconcile_fills=self._reconcile_unsettled if self.rest_fill_source else None,
                 ).run()
         level = "critical" if action == "kill" else "warning"
         await self._record(level, f"risk.{action}", {"resume": "报价已恢复", "pause": "报价已暂停", "kill": "紧急停止已触发", "reset-kill": "紧急停止已解除"}[action])
         self._publish()
 
     async def simulate_fill(self, request: PaperFillRequest):
-        """Compatibility name: inject a fill at the fake exchange boundary."""
-        symbol = (request.symbol or self.state.activeSymbols[0]).upper()
-        if symbol not in self.state.symbolStates:
-            raise ValueError("所选币种未启用")
-        if self.state.mode != "paper" or not hasattr(self.bittrade, "inject_fill"):
-            raise ValueError("该端点只允许 Paper 模式使用")
-        if not self.state.running or self.state.killSwitch or not self.risk_gate.armed:
-            raise ValueError("Paper 引擎未 Arm，无法注入成交")
-        events = await self.bittrade.inject_fill(symbol, request.side, Decimal(str(request.size)))
-        await self._record("info", "paper.fill.injected", f"已向 FakeBitTrade 注入 {len(events)} 个成交事件", {
-            "symbol": symbol, "side": request.side, "requestedSize": request.size,
-        })
-        return {"accepted": True, "events": len(events), "symbol": symbol, "side": request.side}
+        raise ValueError("Paper/Live 禁止手工注入成交；成交只能来自 BitTrade 公开成交流")
 
     def export_reconciliation(self) -> dict:
         primary = self.state.symbolStates[self.state.activeSymbols[0]]
@@ -541,6 +616,8 @@ class TradingService:
                         if latest is None:
                             continue
                         runtime.market = latest
+                        if self.paper_broker is not None:
+                            self.paper_broker.set_market(latest)
                         if self.state.running:
                             runtime.quotes = self._timed_quotes(latest, runtime.config, runtime.instrument)
                         if self.market_feed.latest_transport.get(symbol) == "ws" \
@@ -564,6 +641,51 @@ class TradingService:
                 self._publish()
         finally:
             self.events.close_queue(EventType.MARKET, queue)
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+            try:
+                await self._send_heartbeat()
+            except Exception as exc:
+                if self._engine_ready:
+                    await self.state_store.audit("alert.heartbeat.failed", "warning", self._safe_error(exc))
+
+    async def _send_heartbeat(self) -> None:
+        if not self.notifier.webhook_url or not self._engine_ready:
+            return
+        day = datetime.now(timezone.utc).date().isoformat()
+        open_orders, fill_count = await asyncio.gather(
+            self.state_store.open_orders(), self.state_store.daily_fill_count(day),
+        )
+        armed = "armed" if self.risk_gate.armed else "disarmed"
+        message = (
+            f"💓 JARB 心跳：{armed} / 挂单 {len(open_orders)} / "
+            f"今日成交 {fill_count} 笔 / 模式 {self.state.mode}"
+        )
+        await self.notifier.send_once("heartbeat", message)
+
+    async def _arm_expiry_warning_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            if self.state.mode != "live" or not self.risk_gate.armed:
+                continue
+            armed_until = self.risk_gate.armed_until
+            remaining = armed_until - time.time()
+            if 0 < remaining <= ARM_EXPIRY_WARNING_SEC and armed_until != self._arm_expiry_warning_for:
+                try:
+                    minutes = max(1, int((remaining + 59) // 60))
+                    sent = await self.notifier.send_once(
+                        f"risk:arm-expiry:{int(armed_until)}",
+                        f"⚠️ JARB 实盘 Arm 将在约 {minutes} 分钟后到期；请检查后手动续期或 Disarm。",
+                    )
+                    if sent:
+                        self._arm_expiry_warning_for = armed_until
+                except Exception as exc:
+                    if self._engine_ready:
+                        await self.state_store.audit(
+                            "alert.webhook.failed", "warning", f"arm expiry alert: {self._safe_error(exc)}",
+                        )
 
     async def _market_watchdog(self) -> None:
         fallback: dict[str, str] = {}
@@ -605,6 +727,8 @@ class TradingService:
                 if runtime is None:
                     continue
                 runtime.market = market
+                if self.paper_broker is not None:
+                    self.paper_broker.set_market(market)
                 if self.state.running:
                     runtime.quotes = self._timed_quotes(market, runtime.config, runtime.instrument)
             self.state.connection = self._connection_state("connected")
@@ -734,9 +858,12 @@ class TradingService:
         }
 
     async def configure_risk_limits(self, update: RiskLimitsUpdate) -> dict:
-        if self.risk_gate.armed:
+        if self.state.mode == "live" and self.risk_gate.armed:
             await self.disarm("risk limits changed", "operator")
         values = update.model_dump(exclude_none=True)
+        # Lease duration is dictated by the mode: one hour for live trading and
+        # 24 hours for Paper runs. Keep accepting the UI's field for compatibility.
+        values.pop("armTtlSec", None)
         minimum_p95 = max(
             runtime.config.gmoPostOnlyTimeoutMs for runtime in self.state.symbolStates.values()
         ) + 1200
@@ -792,8 +919,12 @@ class TradingService:
             allowed = set(asdict(self.risk_gate.limits))
             self.risk_gate.limits = replace(
                 self.risk_gate.limits,
-                **{key: value for key, value in saved_limits.items() if key in allowed},
+                **{key: value for key, value in saved_limits.items() if key in allowed and key != "arm_ttl_sec"},
             )
+        # Do not inherit an arm lease from an older deployment or another mode.
+        self.risk_gate.limits = replace(
+            self.risk_gate.limits, arm_ttl_sec=ARM_TTL_BY_MODE[self.state.mode],
+        )
         minimum_p95 = max(
             runtime.config.gmoPostOnlyTimeoutMs for runtime in self.state.symbolStates.values()
         ) + 1200
@@ -801,6 +932,8 @@ class TradingService:
             self.risk_gate.limits = replace(
                 self.risk_gate.limits, max_hedge_p95_ms=max(2500, minimum_p95),
             )
+            await self.state_store.set_state("risk.limits", asdict(self.risk_gate.limits))
+        elif isinstance(saved_limits, dict) and saved_limits.get("arm_ttl_sec") != self.risk_gate.limits.arm_ttl_sec:
             await self.state_store.set_state("risk.limits", asdict(self.risk_gate.limits))
         self._sync_primary()
 
@@ -860,6 +993,9 @@ class TradingService:
                 ),
                 name="market-stream",
             )
+        if self.bittrade_depth_feed is None:
+            self.bittrade_depth_feed = self._bittrade_depth_factory(list(self.state.activeSymbols))
+            await self.bittrade_depth_feed.start()
         if self.fill_tracker is not None or not self._bittrade_configured():
             return
         if not self.gmo.api_key or not self.gmo.secret_key:
@@ -903,17 +1039,49 @@ class TradingService:
             on_execution=self._on_live_hedge_execution,
         )
         await self.hedge_worker.start()
-        source = BitTradeRestFillSource(self.bittrade, self.state_store)
-        self.rest_fill_source = source
-        self.fill_tracker = FillTracker(
-            self.state_store, self.events, rest_source=source, on_fill=self._on_live_maker_fill,
-        )
-        self.execution_gateway.set_fill_reconciler(self._reconcile_order_matches)
-        stream = self._private_stream_factory(
-            self.bittrade, list(self.state.activeSymbols),
-            on_disconnect=self._ws_disconnected, on_reconnect=self._ws_reconnected,
-        )
-        await self.fill_tracker.start(stream)
+        if self.state.mode == "paper":
+            self.fill_tracker = FillTracker(
+                self.state_store, self.events, on_fill=self._on_live_maker_fill,
+            )
+            await self.fill_tracker.start()
+            saved_matching_stats = await self.state_store.get_state("paper.matching.stats", {})
+            self.paper_engine = PaperMatchingEngine(
+                self.fill_tracker, self.bittrade_depth_feed,
+                maker_fee_bps=lambda symbol: Decimal(str(
+                    self.state.symbolStates[symbol].config.bittradeMakerFeeBps
+                )),
+                initial_stats=saved_matching_stats if isinstance(saved_matching_stats, dict) else {},
+                stats_callback=lambda stats: self.state_store.set_state("paper.matching.stats", stats),
+            )
+            self.execution_gateway.set_fill_reconciler(None)
+            self.execution_gateway.set_paper_engine(self.paper_engine)
+            self.paper_trade_task = asyncio.create_task(
+                self._consume_public_trades(
+                    self._paper_trade_stream_factory(list(self.state.activeSymbols)),
+                ),
+                name="bittrade-public-trades",
+            )
+            self.paper_resync_task = asyncio.create_task(
+                self.paper_engine.resync_queue(), name="paper-queue-resync",
+            )
+        else:
+            source = BitTradeRestFillSource(self.bittrade, self.state_store)
+            self.rest_fill_source = source
+            self.fill_tracker = FillTracker(
+                self.state_store, self.events, rest_source=source, on_fill=self._on_live_maker_fill,
+            )
+            self.execution_gateway.set_fill_reconciler(self._reconcile_order_matches)
+            stream = self._private_stream_factory(
+                self.bittrade, list(self.state.activeSymbols),
+                on_disconnect=self._ws_disconnected, on_reconnect=self._ws_reconnected,
+            )
+            await self.fill_tracker.start(stream)
+
+    async def _consume_public_trades(self, stream: AsyncIterator[PublicTrade]) -> None:
+        async for trade in stream:
+            engine = self.paper_engine
+            if engine is not None:
+                await engine.on_trade(trade)
 
     def _gmo_passive_price(self, symbol: str, side: str) -> Decimal:
         runtime = self.state.symbolStates.get(symbol)
@@ -936,6 +1104,20 @@ class TradingService:
             except asyncio.CancelledError:
                 pass
             self.gmo_market_ws_task = None
+        for attribute in ("paper_trade_task", "paper_resync_task"):
+            task = getattr(self, attribute)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, attribute, None)
+        self.execution_gateway.set_paper_engine(None)
+        self.paper_engine = None
+        if self.bittrade_depth_feed is not None:
+            await self.bittrade_depth_feed.stop()
+            self.bittrade_depth_feed = None
         self._rest_market_fallback.clear()
         self._bittrade_depth_cache.clear()
         self._bittrade_depth_errors.clear()
@@ -1013,7 +1195,12 @@ class TradingService:
             hedge_p95_ms=max(self.state.metrics.hedgeP95Ms, hedge_p95),
         )
         self._last_live_risk_snapshot = snapshot
-        allowed, reason = await self.risk_gate.evaluate(snapshot)
+        # Paper keeps its Arm lease across transient market gaps. Quote placement
+        # below is independently suppressed until both public books are fresh.
+        gate_snapshot = snapshot if self.places_real_orders else RiskSnapshot(
+            market_age_ms=0, stale_market_ms=1,
+        )
+        allowed, reason = await self.risk_gate.evaluate(gate_snapshot)
         if not allowed and reason == "market data stale":
             self.state.running = False
             for runtime in self.state.symbolStates.values():
@@ -1065,6 +1252,16 @@ class TradingService:
 
     async def _run_live_quotes(self) -> None:
         if not self.risk_gate.armed or not self.state.running:
+            return
+        stale_symbols = [
+            symbol for symbol, runtime in self.state.symbolStates.items()
+            if self.market_feed.age_ms(symbol) > runtime.config.staleMarketMs
+        ]
+        if stale_symbols:
+            if await self.state_store.open_orders():
+                await self._cancel_all_live()
+            for symbol in stale_symbols:
+                self.state.symbolStates[symbol].quotes = []
             return
         if self.balance_cache.stale():
             try:
@@ -1230,30 +1427,9 @@ class TradingService:
     async def _bittrade_book(self, symbol: str) -> tuple[
         list[tuple[Decimal, Decimal]], list[tuple[Decimal, Decimal]]
     ]:
-        cached = self._bittrade_depth_cache.get(symbol)
-        now = time.monotonic()
-        if cached and now - cached[0] < 1.0:
-            return cached[1], cached[2]
-        payload = await self.rate_limiter.submit(
-            EndpointGroup.QUERY, Priority.QUERY,
-            lambda: self.bittrade.depth(symbol),
-        )
-        data = payload.get("tick", payload.get("data", {}))
-        if isinstance(data, dict) and isinstance(data.get("tick"), dict):
-            data = data["tick"]
-        bids = data.get("bids", []) if isinstance(data, dict) else []
-        asks = data.get("asks", []) if isinstance(data, dict) else []
-        if not bids or not asks:
-            raise RuntimeError(f"BitTrade {symbol} depth had no best bid/ask")
-        def levels(rows) -> list[tuple[Decimal, Decimal]]:
-            return [(
-                Decimal(str(row[0] if isinstance(row, list | tuple) else row["price"])),
-                Decimal(str(row[1] if isinstance(row, list | tuple) else row.get("size", row.get("amount", "0")))),
-            ) for row in rows]
-        bid_levels = sorted(levels(bids), key=lambda row: row[0], reverse=True)
-        ask_levels = sorted(levels(asks), key=lambda row: row[0])
-        self._bittrade_depth_cache[symbol] = (now, bid_levels, ask_levels)
-        return bid_levels, ask_levels
+        if self.bittrade_depth_feed is None:
+            raise RuntimeError("BitTrade WebSocket 深度流尚未启动")
+        return self.bittrade_depth_feed.book(symbol)
 
     async def _on_live_maker_fill(self, fill: FillDelta) -> None:
         await self._apply_local_maker_balance(fill)
@@ -1499,7 +1675,7 @@ class TradingService:
                     raise ValueError(f"{venue} {code} 底仓必须是非负数")
                 assets[code] = amount
             normalized[venue] = assets
-        if self.risk_gate.armed:
+        if self.state.mode == "live" and self.risk_gate.armed:
             await self.disarm("inventory configuration changed", "operator")
         self.inventory_allocations = normalized
         self.balance_cache.configure_allocations(normalized)

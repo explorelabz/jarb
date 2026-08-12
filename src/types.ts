@@ -31,13 +31,6 @@ export interface InventoryState {
 }
 
 export interface PaperScenarios {
-  autoMatch: boolean
-  partialFills: boolean
-  dustFills: boolean
-  duplicateEvents: boolean
-  outOfOrderEvents: boolean
-  cancelAlreadyFilled: boolean
-  cancelRaceFill: boolean
   gmoPartialFak: boolean
   gmoPostOnlyFillRatio: number
   gmoPostOnlyFillDelayMs: number
@@ -45,17 +38,29 @@ export interface PaperScenarios {
   postOnlyReject: boolean
   randomRateLimit: boolean
   randomNetworkTimeout: boolean
-  autoMatchProbability: number
-  dustProbability: number
-  duplicateProbability: number
-  outOfOrderProbability: number
-  cancelRaceProbability: number
   gmoFillRatio: number
   executionDelayMinMs: number
   executionDelayMaxMs: number
   rateLimitProbability: number
   networkTimeoutProbability: number
   seed: number
+  matching?: {
+    openOrders: number
+    throughFills: number
+    atLevelFills: number
+    throughQty: string
+    atLevelQty: string
+    throughRatio: number
+    publicTradesSeen: number
+    lastTradeTsMs: number
+    publicDepth: Record<string, {
+      ready: boolean
+      ageMs: number
+      bestBid: string
+      bestAsk: string
+      levels: number
+    }>
+  }
 }
 
 export interface AssetHolding {

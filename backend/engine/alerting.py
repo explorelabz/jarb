@@ -29,6 +29,14 @@ class LarkWebhookNotifier:
     def configure(self, value: str) -> None:
         self.webhook_url = self.validate_url(value) if value else ""
 
+    async def send(self, message: str) -> bool:
+        """Send a non-deduplicated safety alert."""
+        if not self.webhook_url:
+            return False
+        async with self._lock:
+            await self._deliver(message)
+            return True
+
     async def send_once(self, key: str, message: str) -> bool:
         if not self.webhook_url:
             return False
@@ -36,16 +44,19 @@ class LarkWebhookNotifier:
             now = time.monotonic()
             if now - self._last_sent.get(key, float("-inf")) < self.cooldown_sec:
                 return False
-            response = await self.client.post(
-                self.webhook_url,
-                json={"msg_type": "text", "content": {"text": message}},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if payload.get("code", payload.get("StatusCode", 0)) != 0:
-                raise RuntimeError(f"Lark webhook rejected alert: {payload.get('msg', payload.get('StatusMessage', 'unknown'))}")
+            await self._deliver(message)
             self._last_sent[key] = now
             return True
+
+    async def _deliver(self, message: str) -> None:
+        response = await self.client.post(
+            self.webhook_url,
+            json={"msg_type": "text", "content": {"text": message}},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code", payload.get("StatusCode", 0)) != 0:
+            raise RuntimeError(f"Lark webhook rejected alert: {payload.get('msg', payload.get('StatusMessage', 'unknown'))}")
 
     async def close(self) -> None:
         if self._owns_client:

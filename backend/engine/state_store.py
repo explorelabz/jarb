@@ -429,6 +429,19 @@ class StateStore:
             ).fetchall()
         return sum((Decimal(row["incremental_qty"]) * Decimal(row["price"]) for row in rows), Decimal("0"))
 
+    async def daily_fill_count(self, day_prefix: str) -> int:
+        return await asyncio.to_thread(self._daily_fill_count_sync, day_prefix)
+
+    def _daily_fill_count_sync(self, day_prefix: str) -> int:
+        with self._lock:
+            row = self._db().execute(
+                "SELECT COUNT(*) AS count FROM fills f "
+                "JOIN orders o ON o.client_order_id=f.client_order_id "
+                "WHERE o.trading_mode=? AND f.occurred_at LIKE ?",
+                (self.trading_mode, f"{day_prefix}%"),
+            ).fetchone()
+        return int(row["count"])
+
     async def daily_realized_pnl(self, day_prefix: str, *, maker_fee_bps: Decimal,
                                  hedge_fee_bps: Decimal | dict[str, Decimal]) -> Decimal:
         return await asyncio.to_thread(

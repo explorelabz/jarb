@@ -161,6 +161,29 @@ async def test_risk_gate_requires_recovery_and_expires(tmp_path, monkeypatch):
     await store.close()
 
 
+@pytest.mark.asyncio
+async def test_risk_disarm_sends_lark_alert_without_blocking_safety(tmp_path):
+    class CaptureNotifier:
+        messages: list[tuple[str, str]] = []
+
+        async def send(self, message: str) -> bool:
+            self.messages.append(message)
+            return True
+
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    notifier = CaptureNotifier()
+    risk = RiskGate(store, confirmation_phrase="ARM", notifier=notifier)
+    await risk.restore()
+    await risk.mark_recovery_complete()
+    await risk.arm("ARM", "alice")
+    await risk.disarm("market data stale", "system")
+
+    assert not risk.armed
+    assert notifier.messages == ["⚠️ JARB 已 DISARM：market data stale（操作者：system）"]
+    await store.close()
+
+
 def test_quote_and_balance_gates_reduce_churn_and_oversizing():
     engine = QuoteEngine(RequotePolicy(
         price_deviation_bps=Decimal("2"), depth_change_ratio=Decimal("0.2"),

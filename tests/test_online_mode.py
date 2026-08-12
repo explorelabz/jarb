@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from decimal import Decimal
 
 import pytest
 
 from backend.engine.domain import HedgeStatus, OrderState
+from backend.engine.paper_matcher import PublicTrade
+from backend.engine.state_store import StateStore
 from backend.models import (
     ConnectionUpdate, MarketTop, PaperScenarioUpdate, RiskLimitsUpdate, StrategyConfig, utc_now,
 )
@@ -22,7 +25,14 @@ class FakeGmo:
 
     async def ticker(self, symbol: str) -> MarketTop:
         return MarketTop(symbol=f"{symbol}_JPY", bid=20_000_000, ask=20_010_000, bidSize=.5, askSize=.4,
-                         timestamp="2026-08-09T00:00:00Z", source="GMO")
+                         timestamp=utc_now(), source="GMO")
+
+    async def market_stream(self, bases: list[str], feed) -> None:
+        """A deterministic stand-in for the public GMO market-data stream."""
+        while True:
+            for base in bases:
+                await feed.update(await self.ticker(base.removesuffix("_JPY")), transport="ws")
+            await asyncio.sleep(.2)
 
     async def symbols(self) -> list[dict]:
         return [
@@ -54,6 +64,83 @@ class FakeBittrade:
             {"base-currency": "xrp", "quote-currency": "jpy", "state": "online", "api-trading": "enabled",
              "amount-precision": 2, "price-precision": 3, "limit-order-min-order-amt": 1, "limit-order-max-order-amt": 100000},
         ]
+
+    async def depth(self, symbol: str) -> dict:
+        bids = [[str(19_996_000 - 4_000 * index), ".0002"] for index in range(20)]
+        asks = [[str(20_014_002 + 4_002 * index), ".0002"] for index in range(20)]
+        return {"tick": {
+            "bids": bids,
+            "asks": asks,
+        }}
+
+
+class FakeDepthFeed:
+    def __init__(self, _symbols: list[str]):
+        self.books = {
+            "BTC_JPY": (
+                [(Decimal(str(19_996_000 - 4_000 * index)), Decimal(".0002")) for index in range(20)],
+                [(Decimal(str(20_014_002 + 4_002 * index)), Decimal(".0002")) for index in range(20)],
+            ),
+            "ETH_JPY": (
+                [(Decimal(str(519_000 - 200 * index)), Decimal(".01")) for index in range(20)],
+                [(Decimal(str(521_000 + 200 * index)), Decimal(".01")) for index in range(20)],
+            ),
+        }
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    def levels(self, symbol: str, side: str):
+        bids, asks = self.books[symbol]
+        return list(bids if side == "BUY" else asks)
+
+    def book(self, symbol: str):
+        return self.levels(symbol, "BUY"), self.levels(symbol, "SELL")
+
+
+async def idle_public_trades(_symbols: list[str]):
+    while True:
+        await asyncio.sleep(3600)
+        if False:
+            yield PublicTrade("BTC_JPY", Decimal("0"), Decimal("0"), "BUY", 0, "never")
+
+
+async def cross_first_paper_order(service: TradingService, trade_id: str = "PUBLIC-1") -> dict:
+    for _ in range(100):
+        engine = service.paper_engine
+        paper_orders = list(engine.orders.values()) if engine is not None else []
+        if paper_orders:
+            paper_order = paper_orders[0]
+            order = await service.state_store.order(paper_order.client_order_id)
+            assert order is not None
+            break
+        await asyncio.sleep(.05)
+    else:
+        raise AssertionError("Paper quote was not registered in the queue matcher")
+    assert service.paper_engine is not None
+    side = paper_order.side
+    price = paper_order.price
+    await service.paper_engine.on_trade(PublicTrade(
+        symbol=paper_order.symbol,
+        price=price + Decimal("1") if side == "SELL" else price - Decimal("1"),
+        qty=paper_order.qty,
+        taker_side="BUY" if side == "SELL" else "SELL",
+        ts_ms=int(time.time() * 1000),
+        trade_id=trade_id,
+    ))
+    return order
+
+
+def paper_market_adapters() -> dict:
+    """Paper execution tests use controlled *live-source* public market adapters."""
+    return {
+        "market_gmo": FakeGmo(), "market_bittrade": FakeBittrade(),
+        "bittrade_depth_factory": FakeDepthFeed,
+        "paper_trade_stream_factory": idle_public_trades,
+    }
 
 
 @pytest.mark.asyncio
@@ -127,9 +214,82 @@ async def test_risk_limits_are_runtime_configurable():
     assert limits["maxSingleOrderJpy"] == 100_000
     assert service.risk_gate.limits.max_abs_delta == .002
     assert service.risk_status()["limits"]["maxHedgeP95Ms"] == 2500
+    assert service.risk_status()["limits"]["armTtlSec"] == 86_400
 
     with pytest.raises(ValueError, match="SOK 等待时间"):
         await service.configure_risk_limits(RiskLimitsUpdate(maxHedgeP95Ms=1000))
+
+
+@pytest.mark.asyncio
+async def test_paper_configuration_keeps_engine_armed_and_uses_day_long_lease(tmp_path):
+    db_path = tmp_path / "state.db"
+    previous = StateStore(db_path)
+    await previous.initialize()
+    await previous.set_state("risk.limits", {"arm_ttl_sec": 3_600})
+    await previous.close()
+
+    service = TradingService(StrategyConfig(maxQuoteSize=.002), db_path=db_path, **paper_market_adapters())
+    await service.start()
+    try:
+        assert service.risk_gate.armed, service.risk_gate.last_reason
+        assert service.risk_status()["limits"]["armTtlSec"] == 86_400
+
+        await service.configure({"symbols": ["BTC_JPY"]})
+        await service.configure_risk_limits(RiskLimitsUpdate(maxDailyLossJpy=90_000))
+        await service.configure_inventory(
+            {"JPY": 1_000_000, "BTC": 1}, {"JPY": 1_000_000, "BTC": 1},
+        )
+
+        assert service.risk_gate.armed, service.risk_gate.last_reason
+        assert service.state.running
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_paper_records_hedge_latency_without_disarming(tmp_path):
+    service = TradingService(
+        StrategyConfig(maxQuoteSize=.002), db_path=tmp_path / "state.db", **paper_market_adapters(),
+    )
+    await service.start()
+    try:
+        service.state.metrics.hedgeP95Ms = 99_999
+        await service._enforce_risk()
+        assert service.risk_gate.armed
+        assert service.state.running
+        assert service._last_live_risk_snapshot.hedge_p95_ms == 99_999
+
+        service.market_feed.latest["BTC_JPY"] = service.state.market.model_copy(
+            update={"timestamp": "2020-01-01T00:00:00Z"},
+        )
+        await service._enforce_risk()
+        assert service.risk_gate.armed
+        assert service.state.running
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_lark_heartbeat_reports_arm_orders_and_today_fills(tmp_path):
+    class CaptureNotifier:
+        webhook_url = "https://open.larksuite.com/open-apis/bot/v2/hook/test"
+        messages: list[tuple[str, str]] = []
+
+        async def send_once(self, key: str, message: str) -> bool:
+            self.messages.append((key, message))
+            return True
+
+    service = TradingService(StrategyConfig(), db_path=tmp_path / "state.db")
+    await service.state_store.initialize()
+    service._engine_ready = True
+    original_notifier = service.notifier
+    notifier = CaptureNotifier()
+    service.notifier = notifier
+    await service._send_heartbeat()
+
+    assert notifier.messages == [("heartbeat", "💓 JARB 心跳：disarmed / 挂单 0 / 今日成交 0 笔 / 模式 paper")]
+    await service.state_store.close()
+    await original_notifier.close()
 
 
 def test_quote_size_is_capped_by_directional_delta_headroom():
@@ -141,7 +301,9 @@ def test_quote_size_is_capped_by_directional_delta_headroom():
 
 @pytest.mark.asyncio
 async def test_multiple_symbols_run_and_reconcile_independently(tmp_path):
-    service = TradingService(StrategyConfig(maxQuoteSize=.002), db_path=tmp_path / "state.db")
+    service = TradingService(
+        StrategyConfig(maxQuoteSize=.002), db_path=tmp_path / "state.db", **paper_market_adapters(),
+    )
     await service.configure({"symbols": ["BTC_JPY", "ETH_JPY"]})
     await service.configure_inventory(
         {"JPY": 1_000_000, "BTC": 1, "ETH": 10},
@@ -150,13 +312,13 @@ async def test_multiple_symbols_run_and_reconcile_independently(tmp_path):
 
     await service.start()
     try:
-        for _ in range(100):
-            if all(service.state.symbolStates[symbol].fillCount for symbol in service.state.activeSymbols):
+        for _ in range(30):
+            if all(runtime.market.source == "GMO" for runtime in service.state.symbolStates.values()):
                 break
             await asyncio.sleep(.1)
         assert service.state.activeSymbols == ["BTC_JPY", "ETH_JPY"]
         assert set(service.state.symbolStates) == {"BTC_JPY", "ETH_JPY"}
-        assert all(service.state.symbolStates[symbol].fillCount for symbol in service.state.activeSymbols)
+        assert all(runtime.market.source == "GMO" for runtime in service.state.symbolStates.values())
         assert set(service.export_reconciliation()["symbols"]) == {"BTC_JPY", "ETH_JPY"}
     finally:
         await service.stop()
@@ -164,13 +326,16 @@ async def test_multiple_symbols_run_and_reconcile_independently(tmp_path):
 
 @pytest.mark.asyncio
 async def test_paper_fill_updates_both_venue_holdings(tmp_path):
-    service = TradingService(StrategyConfig(maxQuoteSize=.002), db_path=tmp_path / "state.db")
+    service = TradingService(
+        StrategyConfig(maxQuoteSize=.002), db_path=tmp_path / "state.db", **paper_market_adapters(),
+    )
     await service.configure_inventory(
         {"JPY": 1_000_000, "BTC": 1},
         {"JPY": 1_000_000, "BTC": 1},
     )
     await service.start()
     try:
+        await cross_first_paper_order(service)
         for _ in range(200):
             if service.state.metrics.fillCount and not await service.state_store.pending_hedges():
                 await asyncio.sleep(.1)  # allow the coalesced UI/holdings projection to publish
@@ -234,13 +399,14 @@ async def test_durable_live_fills_project_to_delta_pnl_and_dashboard(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_paper_mode_automatically_generates_orders_and_hedges(tmp_path):
+async def test_paper_public_trade_generates_fill_and_hedge(tmp_path):
     db_path = tmp_path / "state.db"
     service = TradingService(
-        StrategyConfig(maxQuoteSize=.002), db_path=db_path,
+        StrategyConfig(maxQuoteSize=.002), db_path=db_path, **paper_market_adapters(),
     )
     await service.start()
     try:
+        await cross_first_paper_order(service)
         for _ in range(100):
             if service.state.metrics.fillCount:
                 break
@@ -260,7 +426,9 @@ async def test_paper_mode_automatically_generates_orders_and_hedges(tmp_path):
     finally:
         await service.stop()
 
-    restarted = TradingService(StrategyConfig(maxQuoteSize=.002), db_path=db_path)
+    restarted = TradingService(
+        StrategyConfig(maxQuoteSize=.002), db_path=db_path, **paper_market_adapters(),
+    )
     await restarted.start()
     try:
         assert restarted.state.metrics.fillCount >= 1
@@ -289,8 +457,8 @@ async def test_zero_inventory_disables_entire_pair():
 async def test_paper_fault_switches_are_runtime_configurable():
     service = TradingService(StrategyConfig())
     result = await service.configure_paper_scenarios(PaperScenarioUpdate(**{
-        "dustFills": True, "duplicateEvents": True, "outOfOrderEvents": True,
-        "cancelRaceFill": True, "gmoPartialFak": True, "randomRateLimit": True,
+        "gmoPartialFak": True, "delayedExecutions": True, "randomRateLimit": True,
     }))
-    assert result["dustFills"] is True
     assert result["gmoPartialFak"] is True
+    assert result["matching"]["throughFills"] == 0
+    assert "autoMatch" not in result

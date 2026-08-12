@@ -3,7 +3,7 @@ import {
   Pulse, ArrowClockwise, ArrowsLeftRight, CheckCircle, DownloadSimple, Gauge,
   Lightning, Pause, Play, ShieldCheck, Siren, SlidersHorizontal, Warning,
 } from '@phosphor-icons/react'
-import type { InstrumentRules, InventoryState, PaperScenarios, RiskLimits, RiskStatus, Side, SystemState } from './types'
+import type { InstrumentRules, InventoryState, PaperScenarios, RiskLimits, RiskStatus, SystemState } from './types'
 
 const jpy = new Intl.NumberFormat('ja-JP', { maximumFractionDigits: 0 })
 const decimal = new Intl.NumberFormat('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 8 })
@@ -292,14 +292,12 @@ function Settings({ state, risk, onClose, onSaved }: { state: SystemState; risk:
       </div>
 
       {state.mode === 'paper' && paperScenarios && <div className="settings-section">
-        <div className="settings-title"><div><b>Paper 坏情况注入</b><small>每个开关都作用于 Fake 交易所边界，覆盖真实引擎代码</small></div></div>
+        <div className="settings-title"><div><b>Paper 撮合与对冲</b><small>BitTrade 逐笔成交按队列位置撮合；以下开关只作用于模拟 GMO 对冲边界</small></div></div>
+        <p className="field-note">穿价成交 {paperScenarios.matching?.throughFills ?? 0} · 同价排队命中 {paperScenarios.matching?.atLevelFills ?? 0} · 穿价占比 {((paperScenarios.matching?.throughRatio ?? 0) * 100).toFixed(1)}%</p>
         <div className="paper-scenario-grid">
           {([
-            ['autoMatch', '自动撮合'], ['partialFills', '2–5 次部分成交'], ['dustFills', '小于 GMO 最小量'],
-            ['duplicateEvents', '重复成交推送'], ['outOfOrderEvents', '乱序累计量'],
-            ['cancelAlreadyFilled', '撤单时已成交'], ['cancelRaceFill', '撤单竞速全成'],
             ['gmoPartialFak', 'GMO FAK 部分成交'], ['delayedExecutions', 'GMO 成交延迟'],
-            ['postOnlyReject', 'Post-only 拒单'], ['randomRateLimit', '随机 429'],
+            ['postOnlyReject', 'GMO Post-only 拒单'], ['randomRateLimit', '随机 429'],
             ['randomNetworkTimeout', '随机网络超时'],
           ] as Array<[keyof PaperScenarios, string]>).map(([key, label]) => <label className="confirm-row" key={key}>
             <input type="checkbox" checked={Boolean(paperScenarios[key])} onChange={e => setPaperScenarios(value => value ? ({ ...value, [key]: e.target.checked }) : value)} />
@@ -307,7 +305,6 @@ function Settings({ state, risk, onClose, onSaved }: { state: SystemState; risk:
           </label>)}
         </div>
         <div className="form-pair">
-          <label><span>自动撮合概率 / tick</span><input className="secret-input" type="number" min="0" max="1" step="0.01" value={paperScenarios.autoMatchProbability} onChange={e => setPaperScenarios(v => v ? ({ ...v, autoMatchProbability: Number(e.target.value) }) : v)} /></label>
           <label><span>GMO 部分成交比例</span><input className="secret-input" type="number" min="0.01" max="1" step="0.05" value={paperScenarios.gmoFillRatio} onChange={e => setPaperScenarios(v => v ? ({ ...v, gmoFillRatio: Number(e.target.value) }) : v)} /></label>
           <label><span>GMO SOK 被动成交比例</span><input className="secret-input" type="number" min="0" max="1" step="0.05" value={paperScenarios.gmoPostOnlyFillRatio} onChange={e => setPaperScenarios(v => v ? ({ ...v, gmoPostOnlyFillRatio: Number(e.target.value) }) : v)} /></label>
           <label><span>GMO SOK 模拟成交延迟 ms</span><input className="secret-input" type="number" min="0" max="10000" value={paperScenarios.gmoPostOnlyFillDelayMs} onChange={e => setPaperScenarios(v => v ? ({ ...v, gmoPostOnlyFillDelayMs: Number(e.target.value) }) : v)} /></label>
@@ -378,7 +375,7 @@ function Settings({ state, risk, onClose, onSaved }: { state: SystemState; risk:
       <label><span>Delta 紧急停止阈值基准</span><div className="input-with-unit"><input type="number" step="0.0001" value={form.deltaLimit} onChange={e => set('deltaLimit', e.target.value)} /><i>AUTO</i></div><small>每个币种均独立计算，阈值不会低于该币种最小下单量</small></label>
       <label><span>最大对冲延迟</span><div className="input-with-unit"><input type="number" step="50" value={form.maxHedgeLatencyMs} onChange={e => set('maxHedgeLatencyMs', e.target.value)} /><i>ms</i></div></label>
       <div className="settings-section risk-limit-section">
-        <div className="settings-title"><div><b>实盘自动闸门</b><small>修改任一限额会先自动 Disarm</small></div></div>
+        <div className="settings-title"><div><b>{state.mode === 'live' ? '实盘自动闸门' : 'Paper 运行闸门'}</b><small>{state.mode === 'live' ? '修改任一限额会先自动 Disarm' : 'Paper 配置更新不会中断模拟撮合'}</small></div></div>
         <div className="form-pair">
           <label><span>单笔上限 JPY</span><input className="secret-input" type="number" min="1" value={riskLimits.maxSingleOrderJpy} onChange={e => setRiskLimits(v => ({ ...v, maxSingleOrderJpy: Number(e.target.value) }))} /></label>
           <label><span>日成交额 JPY</span><input className="secret-input" type="number" min="1" value={riskLimits.maxDailyVolumeJpy} onChange={e => setRiskLimits(v => ({ ...v, maxDailyVolumeJpy: Number(e.target.value) }))} /></label>
@@ -386,7 +383,7 @@ function Settings({ state, risk, onClose, onSaved }: { state: SystemState; risk:
           <label><span>绝对 Delta</span><input className="secret-input" type="number" min="0" step="0.0001" value={riskLimits.maxAbsDelta} onChange={e => setRiskLimits(v => ({ ...v, maxAbsDelta: Number(e.target.value) }))} /></label>
           <label><span>连续对冲失败</span><input className="secret-input" type="number" min="1" value={riskLimits.maxHedgeFailures} onChange={e => setRiskLimits(v => ({ ...v, maxHedgeFailures: Number(e.target.value) }))} /></label>
           <label><span>对冲 P95 ms</span><input className="secret-input" type="number" min="1" value={riskLimits.maxHedgeP95Ms} onChange={e => setRiskLimits(v => ({ ...v, maxHedgeP95Ms: Number(e.target.value) }))} /></label>
-          <label><span>Arm 有效期 秒</span><input className="secret-input" type="number" min="60" value={riskLimits.armTtlSec} onChange={e => setRiskLimits(v => ({ ...v, armTtlSec: Number(e.target.value) }))} /></label>
+          <label><span>Arm 有效期 秒</span><input className="secret-input" readOnly value={riskLimits.armTtlSec} /><i>按运行模式固定</i></label>
         </div>
       </div>
       {error && <div className="inline-error"><Warning size={18} weight="fill" />{error}</div>}
@@ -400,7 +397,6 @@ export function App() {
   const [error, setError] = useState('')
   const [settings, setSettings] = useState(false)
   const [busy, setBusy] = useState('')
-  const [fillSide, setFillSide] = useState<Side>('SELL')
   const [selectedSymbol, setSelectedSymbol] = useState('')
   const [risk, setRisk] = useState<RiskStatus | null>(null)
 
@@ -431,19 +427,10 @@ export function App() {
     return { ...state, ...runtime, metrics: { ...state.metrics,
       fillCount: runtime.fillCount, hedgeP95Ms: runtime.hedgeP95Ms } }
   }, [state, activeSymbol])
-  const quote = useMemo(() => viewState?.quotes.find(q => q.side === fillSide), [viewState, fillSide])
-  const simulateSize = viewState && quote ? Math.min(quote.size, Math.max(viewState.instrument.minOrderSize, viewState.instrument.sizeStep)) : 0
   const control = async (action: string) => {
     setBusy(action)
     try { await api('/api/control', { method: 'POST', body: JSON.stringify({ action }) }) }
     catch (e) { setError(e instanceof Error ? e.message : '控制失败') }
-    finally { setBusy('') }
-  }
-  const simulate = async () => {
-    if (!quote) return
-    setBusy('fill')
-    try { await api('/api/paper/fill', { method: 'POST', body: JSON.stringify({ symbol: activeSymbol, side: fillSide, size: simulateSize, role: 'maker' }) }) }
-    catch (e) { setError(e instanceof Error ? e.message : 'Paper 成交注入失败') }
     finally { setBusy('') }
   }
   const toggleArm = async () => {
@@ -491,11 +478,7 @@ export function App() {
       <section className="intro">
         <div><span className="eyebrow">LIQUIDITY OPERATIONS / {viewState.market.symbol}</span><h1>做市与即时对冲</h1><p>{state.mode === 'live' ? `正在并发运行 ${state.activeSymbols.length} 个 GMO 实时行情策略；当前查看 ${viewState.instrument.baseAsset}/JPY。` : `Paper 正通过完整引擎运行 ${state.activeSymbols.length} 个策略；当前查看 ${viewState.instrument.baseAsset}/JPY。`}</p></div>
         <div className="controls">
-          {state.mode === 'paper' ? <div className="sim-control">
-            <button onClick={() => setFillSide('SELL')} className={fillSide === 'SELL' ? 'active' : ''}>客户买入</button>
-            <button onClick={() => setFillSide('BUY')} className={fillSide === 'BUY' ? 'active' : ''}>客户卖出</button>
-            <button className="simulate" onClick={simulate} disabled={!state.running || busy === 'fill' || !simulateSize}><Lightning size={17} weight="fill" />{busy === 'fill' ? '注入中…' : `注入成交 ${decimal.format(simulateSize)} ${viewState.instrument.baseAsset}`}</button>
-          </div> : <>
+          {state.mode === 'paper' ? <div className={`online-note ${state.connection.status}`}><ShieldCheck size={17} />BitTrade 实时队列撮合</div> : <>
             <div className={`online-note ${state.connection.status}`}><ShieldCheck size={17} />{state.connection.status === 'error' ? 'Live 行情异常' : risk?.armed ? '实盘已 Arm' : `DISARMED${risk?.reason ? ` · ${risk.reason}` : ''}`}</div>
             <button className={risk?.armed ? 'kill active' : 'secondary'} onClick={toggleArm} disabled={!!busy || !risk?.recoveryComplete}>{risk?.armed ? 'Disarm 并撤单' : risk?.pendingArmActor ? '第二人复核 Arm' : 'Arm 实盘'}</button>
           </>}
