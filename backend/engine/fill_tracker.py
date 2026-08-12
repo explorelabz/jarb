@@ -65,8 +65,8 @@ class FillTracker:
             occurred_at=event.occurred_at or datetime.now(timezone.utc).isoformat(),
         )
         if delta is not None:
-            # Hedge creation is the critical path. Publish the durably recorded delta
-            # before balance/UI projection so a slow dashboard query cannot delay GMO.
+            # The fill and hedge intent are already committed atomically. Publishing
+            # only wakes the worker; a crash here is recovered from pending intents.
             await self.events.publish(EventType.FILL, delta)
             if self.on_fill is not None:
                 task = asyncio.create_task(self._notify_fill(delta), name="fill-projection")
@@ -123,10 +123,12 @@ class BitTradePrivateWS:
     URL = "wss://api-cloud.bittrade.co.jp/ws/v2"
 
     def __init__(self, adapter: BitTradeAdapter, symbols: list[str], *,
+                 store: StateStore | None = None,
                  on_disconnect: Callable[[Exception], Awaitable[None]] | None = None,
                  on_reconnect: Callable[[], Awaitable[None]] | None = None):
         self.adapter = adapter
         self.symbols = symbols
+        self.store = store
         self.on_disconnect = on_disconnect
         self.on_reconnect = on_reconnect
 
@@ -158,26 +160,7 @@ class BitTradePrivateWS:
                             continue
                         if data.get("eventType") != "trade":
                             continue
-                        order_id = str(data["orderId"])
-                        detail = await self.adapter.order(order_id)
-                        order = detail.get("data", {})
-                        client_id = str(data.get("clientOrderId") or order.get("client-order-id") or "")
-                        if not client_id:
-                            continue
-                        cumulative = order.get("field-amount", order.get("filled-amount", "0"))
-                        yield CumulativeFillEvent(
-                            client_order_id=client_id,
-                            order_id=order_id,
-                            trade_id=str(data["tradeId"]),
-                            symbol=self._symbol(data["symbol"]),
-                            side=str(data["orderSide"]).upper(),
-                            cumulative_qty=Decimal(str(cumulative)),
-                            price=Decimal(str(data["tradePrice"])),
-                            fee=Decimal(str(data.get("transactFee", "0"))),
-                            occurred_at=datetime.fromtimestamp(
-                                int(data["tradeTime"]) / 1000, timezone.utc,
-                            ).isoformat(),
-                        )
+                        yield await self._trade_event(data)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -185,6 +168,49 @@ class BitTradePrivateWS:
                     await self.on_disconnect(exc)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
+
+    async def _trade_event(self, data: dict[str, Any]) -> CumulativeFillEvent:
+        """Resolve one private fill, including the exchange-ID recovery path."""
+        order_id = str(data["orderId"])
+        detail = await self.adapter.order(order_id)
+        order = detail.get("data", {})
+        client_id = str(data.get("clientOrderId") or order.get("client-order-id") or "")
+        symbol = self._symbol(data["symbol"])
+        side = str(data["orderSide"]).upper()
+        if not client_id and self.store is not None:
+            raw_price = order.get("price", data.get("tradePrice"))
+            price = Decimal(str(raw_price)) if raw_price is not None else None
+            client_id = str(await self.store.resolve_client_order_for_exchange_fill(
+                order_id, symbol=symbol, side=side, price=price,
+            ) or "")
+        if not client_id:
+            if self.store is not None:
+                await self.store.audit(
+                    "fill.ws.unresolved", "critical",
+                    "BitTrade private fill could not be mapped to a local order",
+                    metadata={
+                        "orderId": order_id,
+                        "tradeId": str(data.get("tradeId", "")),
+                        "symbol": symbol, "side": side,
+                    },
+                )
+            raise RuntimeError(
+                f"BitTrade fill {data.get('tradeId')} has no resolvable clientOrderId"
+            )
+        cumulative = order.get("field-amount", order.get("filled-amount", "0"))
+        return CumulativeFillEvent(
+            client_order_id=client_id,
+            order_id=order_id,
+            trade_id=str(data["tradeId"]),
+            symbol=symbol,
+            side=side,
+            cumulative_qty=Decimal(str(cumulative)),
+            price=Decimal(str(data["tradePrice"])),
+            fee=Decimal(str(data.get("transactFee", "0"))),
+            occurred_at=datetime.fromtimestamp(
+                int(data["tradeTime"]) / 1000, timezone.utc,
+            ).isoformat(),
+        )
 
     def _auth_payload(self) -> dict:
         timestamp = datetime.fromtimestamp(
@@ -246,6 +272,21 @@ class BitTradeRestFillSource:
             order = by_exchange.get(str(exchange_id)) if exchange_id is not None else None
             if order is None and client_id is not None:
                 order = by_client.get(str(client_id))
+            if order is None and exchange_id is not None:
+                raw_symbol = str(row.get("symbol", ""))
+                symbol = BitTradePrivateWS._symbol(raw_symbol) if raw_symbol else ""
+                raw_side = str(row.get("orderSide", row.get("side", row.get("type", "")))).upper()
+                side = "BUY" if raw_side.startswith("BUY") else "SELL" if raw_side.startswith("SELL") else ""
+                raw_price = row.get("price", row.get("tradePrice"))
+                if symbol and side:
+                    resolved = await self.store.resolve_client_order_for_exchange_fill(
+                        str(exchange_id), symbol=symbol, side=side,
+                        price=Decimal(str(raw_price)) if raw_price is not None else None,
+                    )
+                    if resolved is not None:
+                        order = await self.store.order(resolved)
+                        if order is not None:
+                            by_exchange[str(exchange_id)] = order
             if order is not None:
                 affected[order["client_order_id"]] = order
         self._pending_checkpoint = now_ms

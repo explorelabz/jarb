@@ -163,7 +163,7 @@ h2 { font-size: 19px; letter-spacing: -.025em; font-weight: 600; }
 .section-head.wide { padding-left: 0; padding-right: 0; border-bottom-color: var(--line); }
 .muted { color: var(--muted); font-size: 10px; }
 .trade-head-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
-.export-link { min-height: 29px; padding: 0 9px; border: 1px solid var(--line); color: #929c97; display: inline-flex; align-items: center; gap: 6px; text-decoration: none; font-size: 9px; transition: .2s ease; }
+.export-link { min-height: 29px; padding: 0 9px; border: 1px solid var(--line); color: #929c97; background: transparent; display: inline-flex; align-items: center; gap: 6px; text-decoration: none; font: inherit; font-size: 9px; cursor: pointer; transition: .2s ease; }
 .export-link:hover { color: var(--accent); border-color: rgba(108, 185, 149, .4); background: rgba(108, 185, 149, .05); }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; min-width: 900px; }
@@ -194,7 +194,7 @@ td:first-child small { margin-top: 3px; color: #59625d; font: 400 8px Geist Mono
 .pnl-equation > i { font-style: normal; color: #5c6661; }
 .pnl-equation .net { padding-left: 14px; border-left: 1px solid var(--line); }
 .pnl-equation .net b { color: var(--accent); font-size: 18px; }
-.download { color: var(--muted); text-decoration: none; display: flex; align-items: center; gap: 6px; font-size: 10px; }
+.download { color: var(--muted); background: transparent; border: 0; padding: 0; text-decoration: none; display: flex; align-items: center; gap: 6px; font: inherit; font-size: 10px; cursor: pointer; }
 .download:hover { color: var(--accent); }
 .event-list { padding: 8px 19px 13px; }
 .event { min-height: 32px; display: grid; grid-template-columns: 7px 55px 1fr; align-items: center; gap: 7px; border-bottom: 1px solid #222925; font-size: 9px; }

@@ -52,6 +52,12 @@ export interface PaperScenarios {
     throughRatio: number
     publicTradesSeen: number
     lastTradeTsMs: number
+    gmoPassive: {
+      publicTradesSeen: number
+      fillEvents: number
+      fillQty: string
+      fillsWithoutPublicTrade: number
+    }
     publicDepth: Record<string, {
       ready: boolean
       ageMs: number

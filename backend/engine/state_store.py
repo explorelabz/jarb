@@ -298,11 +298,55 @@ class StateStore:
                     "UPDATE orders SET cumulative_filled=?,state=?,updated_at=CURRENT_TIMESTAMP WHERE client_order_id=?",
                     (str(new_cumulative), next_state, client_order_id),
                 )
-                db.execute("COMMIT")
                 if incremental == 0:
+                    db.execute("COMMIT")
                     return None
-                return FillDelta(cursor.lastrowid, client_order_id, order_id, trade_id, symbol, side,
+                fill = FillDelta(cursor.lastrowid, client_order_id, order_id, trade_id, symbol, side,
                                  cumulative_qty, incremental, price, fee, occurred_at)
+                hedge_side = "SELL" if side == "BUY" else "BUY"
+                db.execute(
+                    "INSERT INTO hedge_intents(id,client_fill_id,symbol,side,qty,status,source_fill_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (f"H-{uuid4().hex}", fill.fill_id, symbol, hedge_side, str(incremental),
+                     HedgeStatus.PENDING, occurred_at),
+                )
+                db.execute("COMMIT")
+                return fill
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
+
+    async def backfill_missing_hedge_intents(self) -> int:
+        return await asyncio.to_thread(self._backfill_missing_hedge_intents_sync)
+
+    def _backfill_missing_hedge_intents_sync(self) -> int:
+        """Repair legacy fills committed before their hedge intent was persisted."""
+        with self._lock:
+            db = self._db()
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                rows = db.execute(
+                    "SELECT f.id,f.symbol,f.side,f.incremental_qty,f.occurred_at FROM fills f "
+                    "JOIN orders o ON o.client_order_id=f.client_order_id "
+                    "LEFT JOIN hedge_intents h ON h.client_fill_id=f.id "
+                    "WHERE o.trading_mode=? AND h.id IS NULL ORDER BY f.id",
+                    (self.trading_mode,),
+                ).fetchall()
+                created = 0
+                for row in rows:
+                    qty = Decimal(row["incremental_qty"])
+                    if qty <= 0:
+                        continue
+                    hedge_side = "SELL" if row["side"] == "BUY" else "BUY"
+                    db.execute(
+                        "INSERT INTO hedge_intents(id,client_fill_id,symbol,side,qty,status,source_fill_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (f"H-{uuid4().hex}", row["id"], row["symbol"], hedge_side, str(qty),
+                         HedgeStatus.PENDING, row["occurred_at"]),
+                    )
+                    created += 1
+                db.execute("COMMIT")
+                return created
             except Exception:
                 db.execute("ROLLBACK")
                 raise
@@ -497,6 +541,51 @@ class StateStore:
                 "SELECT * FROM orders WHERE client_order_id=?", (client_order_id,),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    async def resolve_client_order_for_exchange_fill(
+        self, exchange_order_id: str, *, symbol: str, side: str,
+        price: Decimal | None = None,
+    ) -> str | None:
+        return await asyncio.to_thread(
+            self._resolve_client_order_for_exchange_fill_sync,
+            exchange_order_id, symbol, side, price,
+        )
+
+    def _resolve_client_order_for_exchange_fill_sync(
+        self, exchange_order_id: str, symbol: str, side: str,
+        price: Decimal | None,
+    ) -> str | None:
+        """Bind an exchange id only when one unresolved local order is an exact safe match."""
+        with self._lock:
+            db = self._db()
+            known = db.execute(
+                "SELECT client_order_id FROM orders WHERE trading_mode=? AND exchange_order_id=?",
+                (self.trading_mode, str(exchange_order_id)),
+            ).fetchone()
+            if known is not None:
+                return str(known["client_order_id"])
+            rows = db.execute(
+                "SELECT client_order_id,price FROM orders WHERE trading_mode=? "
+                "AND exchange_order_id IS NULL AND state IN (?,?) AND symbol=? AND side=?",
+                (
+                    self.trading_mode, OrderState.PLACING, OrderState.UNKNOWN,
+                    symbol, side,
+                ),
+            ).fetchall()
+            candidates = [row for row in rows if price is None or Decimal(row["price"]) == price]
+            if len(candidates) != 1:
+                return None
+            client_order_id = str(candidates[0]["client_order_id"])
+            db.execute(
+                "UPDATE orders SET exchange_order_id=?,last_error=?,updated_at=CURRENT_TIMESTAMP "
+                "WHERE client_order_id=? AND exchange_order_id IS NULL",
+                (
+                    str(exchange_order_id),
+                    "exchange order id recovered from private fill",
+                    client_order_id,
+                ),
+            )
+            return client_order_id
 
     async def trading_projection(self, symbol: str | None = None,
                                  trading_mode: str | None = None) -> list[dict]:

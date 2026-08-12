@@ -50,6 +50,7 @@ class ExecutionGateway:
         self.paper_risk_would_reject = 0
         self.paper_risk_reasons: dict[str, int] = {}
         self.paper_risk_last_reason: str | None = None
+        self.paper_risk_last_reason_by_symbol: dict[str, str | None] = {}
 
     def set_fill_reconciler(self, callback: Callable[[dict], Awaitable[None]] | None) -> None:
         self._fill_reconciler = callback
@@ -63,9 +64,10 @@ class ExecutionGateway:
             **{**snapshot.__dict__, "order_notional_jpy": float(qty * price)},
         ), enforce=self.paper_engine is None)
         if self.paper_engine is not None:
-            previous_reason = self.paper_risk_last_reason
+            previous_reason = self.paper_risk_last_reason_by_symbol.get(symbol)
             self.paper_risk_evaluations += 1
             self.paper_risk_last_reason = reason
+            self.paper_risk_last_reason_by_symbol[symbol] = reason
             if not allowed:
                 normalized_reason = reason or "unknown"
                 self.paper_risk_would_reject += 1
@@ -151,6 +153,7 @@ class ExecutionGateway:
             "wouldReject": self.paper_risk_would_reject,
             "reasons": dict(self.paper_risk_reasons),
             "lastReason": self.paper_risk_last_reason,
+            "lastReasonBySymbol": dict(self.paper_risk_last_reason_by_symbol),
         }
 
     async def replace(self, current: dict | None, **new_order: Any) -> dict:
@@ -288,11 +291,25 @@ class ExecutionGateway:
             )
             remote = self._orders(payload)
             remote_client_ids = {
-                str(item.get("client-order-id")) for item in remote if item.get("client-order-id")
+                str(item.get("client-order-id", item.get("clientOrderId"))) for item in remote
+                if item.get("client-order-id", item.get("clientOrderId"))
             }
-            remaining = [row for row in await self.store.open_orders() if row["client_order_id"] in remote_client_ids]
+            remote_exchange_ids = {
+                str(item.get("id", item.get("order-id", item.get("orderId")))) for item in remote
+                if item.get("id", item.get("order-id", item.get("orderId"))) is not None
+            }
+            remaining = [
+                row for row in await self.store.open_orders()
+                if row["client_order_id"] in remote_client_ids
+                or row.get("exchange_order_id") is not None
+                and str(row["exchange_order_id"]) in remote_exchange_ids
+            ]
             if not remaining:
+                unresolved_without_exchange_id: list[dict] = []
                 for row in await self.store.open_orders():
+                    if not row.get("exchange_order_id"):
+                        unresolved_without_exchange_id.append(row)
+                        continue
                     if self._fill_reconciler is not None:
                         await self._fill_reconciler(row)
                         refreshed = await self.store.order(row["client_order_id"])
@@ -304,6 +321,16 @@ class ExecutionGateway:
                     if current != OrderState.CANCELING:
                         await self.store.transition_order(row["client_order_id"], OrderState.UNKNOWN)
                     await self.store.transition_order(row["client_order_id"], OrderState.CANCELED)
+                if unresolved_without_exchange_id:
+                    client_ids = [row["client_order_id"] for row in unresolved_without_exchange_id]
+                    await self.store.audit(
+                        "orders.cancel_all.unresolved", "critical",
+                        "cancel-all cannot prove terminal state for local orders without exchange ids",
+                        metadata={"clientOrderIds": client_ids},
+                    )
+                    raise RuntimeError(
+                        f"{len(client_ids)} UNKNOWN orders have no exchange id; manual reconciliation required"
+                    )
                 return
             await asyncio.sleep(.25)
         raise TimeoutError("cancel-all did not converge to zero open orders")

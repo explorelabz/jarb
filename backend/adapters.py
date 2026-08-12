@@ -58,12 +58,16 @@ class GmoAdapter:
         book = payload.get("data", {})
         if payload.get("status") != 0 or not book.get("bids") or not book.get("asks"):
             raise RuntimeError(f"GMO orderbook failed: {payload.get('messages', payload)}")
-        bids = [(float(row["price"]), float(row["size"])) for row in book["bids"]]
-        asks = [(float(row["price"]), float(row["size"])) for row in book["asks"]]
+        bids_exact = [(Decimal(str(row["price"])), Decimal(str(row["size"]))) for row in book["bids"]]
+        asks_exact = [(Decimal(str(row["price"])), Decimal(str(row["size"]))) for row in book["asks"]]
+        bids = [(float(price), float(size)) for price, size in bids_exact]
+        asks = [(float(price), float(size)) for price, size in asks_exact]
         bid, ask = book["bids"][0], book["asks"][0]
         return MarketTop(symbol=f"{symbol}_JPY", bid=float(bid["price"]), ask=float(ask["price"]),
                          bidSize=float(bid["size"]), askSize=float(ask["size"]),
                          bids=bids, asks=asks,
+                         bidExact=bids_exact[0][0], askExact=asks_exact[0][0],
+                         bidsExact=bids_exact, asksExact=asks_exact,
                          timestamp=payload.get("responsetime", datetime.now(timezone.utc).isoformat()), source="GMO")
 
     async def symbols(self) -> list[dict]:

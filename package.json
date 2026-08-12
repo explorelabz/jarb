@@ -8,7 +8,7 @@
     "dev:api": ".venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8787",
     "dev:web": "vite",
     "build": "tsc -b && vite build",
-    "start": ".venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8787",
+    "start": ".venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8787",
     "test": ".venv/bin/python -m pytest -q",
     "bench": ".venv/bin/python benchmarks/core_bench.py",
     "rust:build": "bash scripts/build_rust.sh"

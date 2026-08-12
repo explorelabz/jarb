@@ -11,7 +11,7 @@ from typing import Protocol
 
 from ..adapters import GmoAdapter
 from ..models import Side
-from .domain import EventType, FillDelta, HedgeIntent, HedgeStatus
+from .domain import EventType, HedgeIntent, HedgePreconditionError, HedgeStatus
 from .events import EventBus
 from .rate_limit import EndpointGroup, Priority, PriorityRateLimiter
 from .risk import RiskGate
@@ -66,6 +66,12 @@ class HedgeWorker:
 
     async def start(self) -> None:
         if self._listener is None:
+            repaired = await self.store.backfill_missing_hedge_intents()
+            if repaired:
+                await self.store.audit(
+                    "hedge.intent.recovered", "critical",
+                    f"recreated {repaired} missing hedge intent(s) from durable fills",
+                )
             await self._recover_inflight()
             self._fill_queue = self.events.open_queue(EventType.FILL)
             self._listener = asyncio.create_task(self._listen(), name="hedge-fill-listener")
@@ -145,10 +151,7 @@ class HedgeWorker:
         if self._fill_queue is None:
             raise RuntimeError("fill queue is not initialized")
         while True:
-            event = await self._fill_queue.get()
-            fill: FillDelta = event.payload
-            hedge_side = "SELL" if fill.side == "BUY" else "BUY"
-            await self.store.create_hedge_intent(fill, hedge_side)
+            await self._fill_queue.get()
             self._wake.set()
 
     async def _run(self) -> None:
@@ -215,6 +218,14 @@ class HedgeWorker:
 
     async def _execute_group(self, key: tuple[str, str], intents: list[HedgeIntent], qty: Decimal) -> None:
         symbol, side = key
+        inflight = [
+            intent for intent in intents
+            if intent.status == HedgeStatus.HEDGING and intent.exchange_order_id
+        ]
+        if inflight:
+            await self._resolve_inflight(inflight)
+            self._wake.set()
+            return
         active: list[HedgeIntent] = []
         for intent in intents:
             if intent.attempts >= self.max_attempts:
@@ -224,10 +235,20 @@ class HedgeWorker:
             active.append(await self.store.transition_hedge(intent.id, HedgeStatus.HEDGING))
         if not active:
             return
+        active_qty = sum(
+            (intent.qty - intent.filled_qty for intent in active), Decimal("0"),
+        )
+        if active_qty <= 0:
+            return
+        checkpointed_order_id: str | None = None
         if hasattr(self.executor, "set_checkpoint"):
             async def checkpoint(order_id: str, filled_qty: Decimal = Decimal("0"),
                                  filled_notional: Decimal = Decimal("0"),
                                  fee_jpy: Decimal = Decimal("0")) -> None:
+                nonlocal checkpointed_order_id
+                # Mark the group as externally submitted before any SQLite write.
+                # Even a checkpoint failure must not permit a blind second order.
+                checkpointed_order_id = order_id
                 available = filled_qty
                 average = filled_notional / filled_qty if filled_qty else Decimal("0")
                 for intent in active:
@@ -244,24 +265,42 @@ class HedgeWorker:
                     )
             self.executor.set_checkpoint(checkpoint)
         try:
-            result = await self.executor(symbol, side, qty)
+            result = await self.executor(symbol, side, active_qty)
         except Exception as exc:
             await self.store.audit(
                 "hedge.retry", "warning", f"{symbol} {side}: {str(exc)[:200]}",
                 metadata={
                     "intentIds": [intent.id for intent in active],
                     "attempts": max(intent.attempts for intent in active),
-                    "qty": str(qty),
+                    "qty": str(active_qty),
+                    "exchangeOrderId": checkpointed_order_id,
                 },
             )
-            for intent in active:
-                target = HedgeStatus.ESCALATE if intent.attempts >= self.max_attempts else HedgeStatus.RETRY
-                await self.store.transition_hedge(intent.id, target, error=str(exc)[:240])
-            if any(item.attempts >= self.max_attempts for item in active):
-                await self.risk.disarm(f"hedge failed repeatedly for {symbol}")
-            else:
-                await asyncio.sleep(min(2 ** max(item.attempts for item in active) * .1, 5))
+            if checkpointed_order_id is not None:
+                for intent in active:
+                    await self.store.transition_hedge(
+                        intent.id, HedgeStatus.HEDGING,
+                        exchange_order_id=checkpointed_order_id, error=str(exc)[:240],
+                    )
+                await self.risk.disarm(f"unresolved hedge order {checkpointed_order_id} for {symbol}")
                 self._wake.set()
+                return
+            if isinstance(exc, HedgePreconditionError):
+                for intent in active:
+                    await self.store.transition_hedge(
+                        intent.id, HedgeStatus.RETRY, error=str(exc)[:240],
+                    )
+                await self.risk.disarm(f"hedge precondition failed for {symbol}")
+                self._wake.set()
+                return
+            # Without an order id a response timeout is still ambiguous: GMO may have
+            # accepted the FAK. Manual reconciliation is safer than a second order.
+            for intent in active:
+                await self.store.transition_hedge(
+                    intent.id, HedgeStatus.ESCALATE,
+                    error=f"ambiguous hedge submission: {str(exc)[:200]}",
+                )
+            await self.risk.disarm(f"manual hedge reconciliation required for {symbol}")
             return
 
         available = result.filled_qty
@@ -284,8 +323,65 @@ class HedgeWorker:
             )
         if self.on_execution is not None and result.filled_qty > 0:
             await self.on_execution(symbol, side, result)
-        if result.filled_qty < qty:
+        if result.filled_qty < active_qty:
             self._wake.set()
+
+    async def _resolve_inflight(self, intents: list[HedgeIntent]) -> None:
+        grouped: dict[str, list[HedgeIntent]] = defaultdict(list)
+        for intent in intents:
+            if intent.exchange_order_id:
+                grouped[intent.exchange_order_id].append(intent)
+        for order_id, group in grouped.items():
+            if self.resolver is None:
+                for intent in group:
+                    await self.store.transition_hedge(
+                        intent.id, HedgeStatus.ESCALATE,
+                        error="no resolver for checkpointed hedge order",
+                    )
+                await self.risk.disarm(f"manual hedge reconciliation required for {group[0].symbol}")
+                continue
+            try:
+                result = await self.resolver(group[0])
+            except Exception as exc:
+                for intent in group:
+                    await self.store.transition_hedge(
+                        intent.id, HedgeStatus.HEDGING,
+                        exchange_order_id=order_id, error=str(exc)[:240],
+                    )
+                await self.store.audit(
+                    "hedge.resolve.pending", "critical",
+                    f"{group[0].symbol} order {order_id} remains unresolved: {str(exc)[:200]}",
+                    metadata={"intentIds": [intent.id for intent in group]},
+                )
+                await self.risk.disarm(f"unresolved hedge order {order_id} for {group[0].symbol}")
+                return
+            if result is None:
+                for intent in group:
+                    await self.store.transition_hedge(
+                        intent.id, HedgeStatus.RETRY,
+                        error="exchange confirmed checkpointed order absent",
+                    )
+                continue
+            available = result.filled_qty
+            average = result.filled_notional / result.filled_qty if result.filled_qty else Decimal("0")
+            for intent in group:
+                required = intent.qty - intent.filled_qty
+                allocated = min(required, available)
+                available -= allocated
+                total = intent.filled_qty + allocated
+                allocated_fee = result.fee_jpy * allocated / result.filled_qty \
+                    if result.filled_qty else Decimal("0")
+                target = HedgeStatus.HEDGED if total >= intent.qty else HedgeStatus.RETRY
+                await self.store.transition_hedge(
+                    intent.id, target, filled_qty=total,
+                    filled_notional=intent.filled_notional + allocated * average,
+                    fee_jpy=intent.fee_jpy + allocated_fee,
+                    latency_ms=self._latency_ms(intent, result.confirmed_at),
+                    exchange_order_id=result.order_id,
+                    error=None if target == HedgeStatus.HEDGED else "resolved partial hedge",
+                )
+            if self.on_execution is not None and result.filled_qty > 0:
+                await self.on_execution(group[0].symbol, group[0].side, result)
 
     @staticmethod
     def _latency_ms(intent: HedgeIntent, confirmed_at: str = "") -> int:
@@ -372,7 +468,9 @@ class GmoHedgeExecutor:
             submitted_at=submitted_at,
         )
         return HedgeExecution(
-            order_id=f"{passive_id}+{fallback.order_id}",
+            # Persist one real exchange identifier only. The fallback checkpoint
+            # already replaced the passive id after durably carrying its fills.
+            order_id=fallback.order_id,
             filled_qty=passive_filled + fallback.filled_qty,
             filled_notional=passive_notional + fallback.filled_notional,
             fee_jpy=passive_fee + fallback.fee_jpy,
@@ -438,7 +536,7 @@ class GmoHedgeExecutor:
                 carried_fee=passive_fee, submitted_at=intent.created_at,
             )
             return HedgeExecution(
-                f"{intent.exchange_order_id}+{fallback.order_id}",
+                fallback.order_id,
                 passive_filled + fallback.filled_qty,
                 passive_notional + fallback.filled_notional,
                 passive_fee + fallback.fee_jpy,
@@ -458,17 +556,10 @@ class GmoHedgeExecutor:
     async def _watch_passive(self, order_id: str, expected: Decimal, price: Decimal, *,
                              timeout_sec: float) -> tuple[Decimal, Decimal, str]:
         # SOK uses one fixed limit price, so cumulative executedSize from the order
-        # record is sufficient to calculate notional exactly. Polling executions and
-        # orders every 100ms for every concurrent hedge starves the QUERY token bucket
-        # and increases (rather than decreases) real exposure time.
-        paper_poll_interval = getattr(self.adapter, "passive_poll_interval_sec", None)
-        if paper_poll_interval is None:
-            await asyncio.sleep(timeout_sec)
-            detail = await self._order_detail(order_id)
-            status = str(detail.get("status", "")).upper()
-            filled = min(expected, Decimal(str(detail.get("executedSize", "0") or "0")))
-            return filled, filled * price, status
+        # record is sufficient to calculate notional exactly. Paper and live share
+        # this bounded backoff path; all queries still pass through the same limiter.
         deadline = asyncio.get_running_loop().time() + timeout_sec
+        poll_interval = .1
         while True:
             detail = await self._order_detail(order_id)
             status = str(detail.get("status", "")).upper()
@@ -478,7 +569,8 @@ class GmoHedgeExecutor:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return filled, filled * price, status
-            await asyncio.sleep(min(float(paper_poll_interval), remaining))
+            await asyncio.sleep(min(poll_interval, remaining))
+            poll_interval = min(poll_interval * 1.5, .5)
 
     async def _cancel_passive(self, order_id: str, expected: Decimal,
                               price: Decimal) -> tuple[Decimal, Decimal]:
@@ -550,13 +642,29 @@ class GmoHedgeExecutor:
                 last_error = exc
                 await asyncio.sleep(.15)
                 continue
-            if status in ("EXECUTED", "CANCELED") and filled > 0:
+            if status in ("EXECUTED", "CANCELED", "EXPIRED") and filled > 0:
                 return filled, notional, confirmed_at
             # A terminal order status can become visible just before executions are
             # queryable. Returning zero here would immediately submit a duplicate hedge.
             # Keep polling until rows arrive; a genuinely zero-filled FAK times out and
             # escalates instead of being retried blindly.
             await asyncio.sleep(.15)
+        # A final ordered snapshot establishes the only safe zero-fill retry case.
+        # Every ambiguous/partially observable terminal state remains unresolved.
+        try:
+            filled, notional = await self._execution_snapshot(order_id)
+            order = await self._order_detail(order_id)
+            status = str(order.get("status", "")).upper()
+            executed = Decimal(str(order.get("executedSize", "0") or "0"))
+            confirmed_at = datetime.now(timezone.utc).isoformat()
+            if filled >= expected or (
+                status in ("EXECUTED", "CANCELED", "EXPIRED") and filled > 0
+            ):
+                return filled, notional, confirmed_at
+            if status in ("CANCELED", "EXPIRED") and filled == 0 and executed == 0:
+                return Decimal("0"), Decimal("0"), confirmed_at
+        except Exception as exc:
+            last_error = exc
         detail = f"；最后查询错误：{last_error}" if last_error else ""
         raise RuntimeError(f"GMO 对冲 {order_id} 成交量未在 {timeout_sec:g}s 内确认{detail}")
 

@@ -13,7 +13,9 @@ from pydantic import BaseModel, Field
 
 from ..adapters import DecimalQuote, ExchangeAPIError
 from ..models import MarketTop, utc_now
+from .domain import HedgePreconditionError
 from .fill_tracker import CumulativeFillEvent
+from .paper_matcher import PublicTrade
 from .paper_queue import QueuePosition
 
 
@@ -76,6 +78,10 @@ class PaperBroker:
         self._order_seq = 0
         self._trade_seq = 0
         self._gmo_seq = 0
+        self.gmo_public_trades_seen = 0
+        self.gmo_sok_fill_events = 0
+        self.gmo_sok_fill_qty = Decimal("0")
+        self.gmo_sok_fills_without_public_trade = 0
         self.balances: dict[str, dict[str, Decimal]] = {
             "bittrade": {"JPY": Decimal("1000000"), **{base: Decimal("10") for base in PAPER_SYMBOLS}},
             "gmo": {"JPY": Decimal("1000000"), **{base: Decimal("10") for base in PAPER_SYMBOLS}},
@@ -116,6 +122,12 @@ class PaperBroker:
         self._order_seq = int(payload.get("orderSeq", self._order_seq))
         self._trade_seq = int(payload.get("tradeSeq", self._trade_seq))
         self._gmo_seq = int(payload.get("gmoSeq", self._gmo_seq))
+        self.gmo_public_trades_seen = int(payload.get("gmoPublicTradesSeen", 0))
+        self.gmo_sok_fill_events = int(payload.get("gmoSokFillEvents", 0))
+        self.gmo_sok_fill_qty = Decimal(str(payload.get("gmoSokFillQty", "0")))
+        self.gmo_sok_fills_without_public_trade = int(
+            payload.get("gmoSokFillsWithoutPublicTrade", 0)
+        )
 
     async def persist(self) -> None:
         if self.state_store is None:
@@ -156,6 +168,10 @@ class PaperBroker:
                 for venue, assets in self.balances.items()
             },
             "orderSeq": self._order_seq, "tradeSeq": self._trade_seq, "gmoSeq": self._gmo_seq,
+            "gmoPublicTradesSeen": self.gmo_public_trades_seen,
+            "gmoSokFillEvents": self.gmo_sok_fill_events,
+            "gmoSokFillQty": str(self.gmo_sok_fill_qty),
+            "gmoSokFillsWithoutPublicTrade": self.gmo_sok_fills_without_public_trade,
         })
 
     def configure(self, patch: dict[str, Any]) -> PaperScenarioConfig:
@@ -184,10 +200,10 @@ class PaperBroker:
     def execution_market(self, symbol: str, *, stale_after_sec: float = 3.0) -> MarketTop:
         updated_at = self._live_market_updated_at.get(symbol)
         if updated_at is None:
-            raise RuntimeError(f"{symbol} 没有可用于 Paper 对冲的真实 GMO 盘口")
+            raise HedgePreconditionError(f"{symbol} 没有可用于 Paper 对冲的真实 GMO 盘口")
         age = time.monotonic() - updated_at
         if age > stale_after_sec:
-            raise RuntimeError(f"{symbol} Paper 对冲的 GMO 盘口已过期（{age:.1f}s）")
+            raise HedgePreconditionError(f"{symbol} Paper 对冲的 GMO 盘口已过期（{age:.1f}s）")
         return self.markets[symbol]
 
     async def market_stream(self, bases: list[str], feed) -> None:
@@ -321,14 +337,21 @@ class PaperBroker:
         level_gap = max(tick, (mid * Decimal("0.00004") / tick).to_integral_value(rounding=ROUND_DOWN) * tick)
         bid_levels: list[tuple[float, float]] = []
         ask_levels: list[tuple[float, float]] = []
+        bid_levels_exact: list[tuple[Decimal, Decimal]] = []
+        ask_levels_exact: list[tuple[Decimal, Decimal]] = []
         for index in range(10):
             multiplier = Decimal(str(1 + index))
             level_size = depth * Decimal(str(self.rng.uniform(.6, 1.8)))
-            bid_levels.append((float(bid - level_gap * Decimal(index)), float(level_size * multiplier)))
-            ask_levels.append((float(ask + level_gap * Decimal(index)), float(level_size * multiplier)))
+            bid_row = (bid - level_gap * Decimal(index), level_size * multiplier)
+            ask_row = (ask + level_gap * Decimal(index), level_size * multiplier)
+            bid_levels_exact.append(bid_row)
+            ask_levels_exact.append(ask_row)
+            bid_levels.append((float(bid_row[0]), float(bid_row[1])))
+            ask_levels.append((float(ask_row[0]), float(ask_row[1])))
         return MarketTop(
             symbol=f"{base}_JPY", bid=float(bid), ask=float(ask), bidSize=float(depth),
             askSize=ask_levels[0][1], bids=bid_levels, asks=ask_levels,
+            bidExact=bid, askExact=ask, bidsExact=bid_levels_exact, asksExact=ask_levels_exact,
             timestamp=utc_now(), source="SIM",
         )
 
@@ -347,8 +370,8 @@ class FakeBitTrade:
                           size_step: Decimal, price_tick: Decimal) -> dict:
         self.broker.maybe_fault()
         market = self.broker.markets[symbol]
-        best_bid = Decimal(str(market.bid)) * Decimal("0.9998")
-        best_ask = Decimal(str(market.ask)) * Decimal("1.0002")
+        best_bid = market.decimal_bid() * Decimal("0.9998")
+        best_ask = market.decimal_ask() * Decimal("1.0002")
         crosses = quote.side == "BUY" and quote.price >= best_ask or quote.side == "SELL" and quote.price <= best_bid
         if crosses and self.broker.scenarios.postOnlyReject:
             raise ExchangeAPIError("BitTrade", "post-only order would immediately match", code="order-value-error")
@@ -423,9 +446,9 @@ class FakeBitTrade:
     async def depth(self, symbol: str) -> dict:
         self.broker.maybe_fault()
         market = self.broker.markets[symbol]
-        bid = Decimal(str(market.bid)) * Decimal("0.9998")
-        ask = Decimal(str(market.ask)) * Decimal("1.0002")
-        gap = Decimal(str(market.bid)) * Decimal("0.0002")
+        bid = market.decimal_bid() * Decimal("0.9998")
+        ask = market.decimal_ask() * Decimal("1.0002")
+        gap = market.decimal_bid() * Decimal("0.0002")
         return {"status": "ok", "tick": {
             "bids": [[str(bid - gap * index), str(Decimal("0.0002") * (index + 1))]
                      for index in range(20)],
@@ -468,8 +491,6 @@ class FakeBitTrade:
 
 
 class FakeGmo:
-    passive_poll_interval_sec = .05
-
     def __init__(self, broker: PaperBroker):
         self.broker = broker
         self.api_key = "paper-key"
@@ -496,15 +517,12 @@ class FakeGmo:
         ratio = Decimal(str(self.broker.scenarios.gmoFillRatio)) if self.broker.scenarios.gmoPartialFak else Decimal("1")
         target = (requested * ratio / size_step).to_integral_value(rounding=ROUND_DOWN) * size_step
         target = min(requested, max(Decimal("0"), target))
-        raw_levels = market.asks if side == "BUY" else market.bids
-        levels = [
-            (Decimal(str(level[0])), Decimal(str(level[1]))) for level in raw_levels
-            if len(level) >= 2 and Decimal(str(level[1])) > 0
-        ]
+        raw_levels = market.decimal_asks() if side == "BUY" else market.decimal_bids()
+        levels = [(price, qty) for price, qty in raw_levels if qty > 0]
         if not levels:
-            fallback_price = market.ask if side == "BUY" else market.bid
+            fallback_price = market.decimal_ask() if side == "BUY" else market.decimal_bid()
             fallback_size = market.askSize if side == "BUY" else market.bidSize
-            levels = [(Decimal(str(fallback_price)), Decimal(str(fallback_size)))]
+            levels = [(fallback_price, Decimal(str(fallback_size)))]
         filled = Decimal("0")
         notional = Decimal("0")
         last_price = Decimal("0")
@@ -542,10 +560,9 @@ class FakeGmo:
         order_id = f"PAPER-GMO-{self.broker._gmo_seq}"
         requested = Decimal(str(size))
         limit_price = Decimal(str(price))
-        same_side_levels = market.bids if side == "BUY" else market.asks
+        same_side_levels = market.decimal_bids() if side == "BUY" else market.decimal_asks()
         queue = QueuePosition.from_levels([
-            (Decimal(str(level[0])), Decimal(str(level[1]))) for level in same_side_levels
-            if len(level) >= 2 and Decimal(str(level[1])) > 0
+            (level_price, level_qty) for level_price, level_qty in same_side_levels if level_qty > 0
         ], side, limit_price)
         self.broker.gmo_orders[order_id] = {
             "orderId": order_id, "symbol": symbol, "side": side, "requested": requested,
@@ -559,7 +576,8 @@ class FakeGmo:
         await self.broker.persist()
         return {"status": 0, "data": {"orderId": order_id}}
 
-    def _evaluate_post_only(self, row: dict[str, Any]) -> bool:
+    def _resync_post_only(self, row: dict[str, Any]) -> bool:
+        """Shrink visible queue from books without ever manufacturing execution flow."""
         if row.get("canceled") or row.get("terminal") or time.time() < row["available_at"]:
             return False
         market = self.broker.execution_market(row["symbol"])
@@ -568,59 +586,93 @@ class FakeGmo:
             return False
         row["last_market_version"] = market_version
         limit_price = Decimal(str(row["price"]))
-        same_side_raw = market.bids if row["side"] == "BUY" else market.asks
-        same_side_levels = [
-            (Decimal(str(level[0])), Decimal(str(level[1]))) for level in same_side_raw
-            if len(level) >= 2 and Decimal(str(level[1])) > 0
-        ]
+        same_side_raw = market.decimal_bids() if row["side"] == "BUY" else market.decimal_asks()
+        same_side_levels = [(price, qty) for price, qty in same_side_raw if qty > 0]
         queue = QueuePosition(
             Decimal(str(row.get("ahead_better", "0"))),
             Decimal(str(row.get("ahead_same", "0"))),
         )
         previous_queue = (queue.ahead_better, queue.ahead_same)
         queue.resync(same_side_levels, row["side"], limit_price)
-        raw_levels = market.asks if row["side"] == "BUY" else market.bids
-        opposite_levels = [
-            (Decimal(str(level[0])), Decimal(str(level[1]))) for level in raw_levels
-            if len(level) >= 2 and Decimal(str(level[1])) > 0
-        ]
-        if not opposite_levels:
-            fallback_price = market.ask if row["side"] == "BUY" else market.bid
-            fallback_size = market.askSize if row["side"] == "BUY" else market.bidSize
-            opposite_levels = [(Decimal(str(fallback_price)), Decimal(str(fallback_size)))]
-        if row["side"] == "BUY":
-            touched = [(price, qty) for price, qty in opposite_levels if price <= limit_price]
-            through = any(price < limit_price for price, _ in touched)
-        else:
-            touched = [(price, qty) for price, qty in opposite_levels if price >= limit_price]
-            through = any(price > limit_price for price, _ in touched)
         row["ahead_better"] = queue.ahead_better
         row["ahead_same"] = queue.ahead_same
-        if not touched:
-            return previous_queue != (queue.ahead_better, queue.ahead_same)
-        available = sum((qty for _, qty in touched), Decimal("0"))
-        if through:
-            queue.clear()
-        consumed = queue.consume(available)
-        available -= consumed
-        row["ahead_better"] = queue.ahead_better
-        row["ahead_same"] = queue.ahead_same
+        return previous_queue != (queue.ahead_better, queue.ahead_same)
+
+    def _apply_post_only_fill(self, row: dict[str, Any], execution_qty: Decimal, *,
+                              caused_by_public_trade: bool) -> None:
+        if execution_qty <= 0:
+            return
         requested = Decimal(str(row["requested"]))
-        step = Decimal(str(row.get("size_step", "0.00000001")))
         previous_filled = Decimal(str(row.get("filled", "0")))
-        execution_qty = min(requested - previous_filled, available)
-        execution_qty = (execution_qty / step).to_integral_value(rounding=ROUND_DOWN) * step
-        if execution_qty > 0:
-            row["filled"] = previous_filled + execution_qty
-            row["partial"] = row["filled"] < requested
-            row["terminal"] = True
-            self.broker.apply_gmo_balance(
-                row["symbol"].removesuffix("_JPY"), row["side"], execution_qty,
-                execution_qty * limit_price,
-            )
-        return execution_qty > 0 or previous_queue != (
-            queue.ahead_better, queue.ahead_same,
+        row["filled"] = previous_filled + execution_qty
+        row["partial"] = row["filled"] < requested
+        row["terminal"] = row["filled"] >= requested
+        self.broker.gmo_sok_fill_events += 1
+        self.broker.gmo_sok_fill_qty += execution_qty
+        if not caused_by_public_trade:
+            self.broker.gmo_sok_fills_without_public_trade += 1
+        limit_price = Decimal(str(row["price"]))
+        self.broker.apply_gmo_balance(
+            row["symbol"].removesuffix("_JPY"), row["side"], execution_qty,
+            execution_qty * limit_price,
         )
+
+    async def on_public_trade(self, trade: PublicTrade) -> None:
+        """Advance SOK FIFO queues only from GMO public taker trade flow."""
+        if trade.qty <= 0 or trade.taker_side not in ("BUY", "SELL"):
+            return
+        self.broker.gmo_public_trades_seen += 1
+        available = trade.qty
+        changed = False
+        for row in self.broker.gmo_orders.values():
+            if available <= 0:
+                break
+            if row.get("timeInForce") != "SOK" or row.get("canceled") or row.get("terminal"):
+                continue
+            if row.get("symbol") != trade.symbol or time.time() < row["available_at"]:
+                continue
+            if trade.taker_side == "BUY" and row["side"] != "SELL":
+                continue
+            if trade.taker_side == "SELL" and row["side"] != "BUY":
+                continue
+            limit_price = Decimal(str(row["price"]))
+            through = trade.price > limit_price if row["side"] == "SELL" else trade.price < limit_price
+            at_level = trade.price == limit_price
+            if not through and not at_level:
+                continue
+            queue = QueuePosition(
+                Decimal(str(row.get("ahead_better", "0"))),
+                Decimal(str(row.get("ahead_same", "0"))),
+            )
+            if through:
+                queue.clear()
+            consumed = queue.consume(available)
+            available -= consumed
+            row["ahead_better"] = queue.ahead_better
+            row["ahead_same"] = queue.ahead_same
+            changed = changed or consumed > 0
+            requested = Decimal(str(row["requested"]))
+            previous_filled = Decimal(str(row.get("filled", "0")))
+            step = Decimal(str(row.get("size_step", "0.00000001")))
+            execution_qty = min(requested - previous_filled, available)
+            execution_qty = (execution_qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+            if execution_qty <= 0:
+                continue
+            available -= execution_qty
+            self._apply_post_only_fill(
+                row, execution_qty, caused_by_public_trade=True,
+            )
+            changed = True
+        if changed:
+            await self.broker.persist()
+
+    def passive_stats(self) -> dict[str, Any]:
+        return {
+            "publicTradesSeen": self.broker.gmo_public_trades_seen,
+            "fillEvents": self.broker.gmo_sok_fill_events,
+            "fillQty": str(self.broker.gmo_sok_fill_qty),
+            "fillsWithoutPublicTrade": self.broker.gmo_sok_fills_without_public_trade,
+        }
 
     async def cancel_order(self, order_id: str) -> dict:
         row = self.broker.gmo_orders[str(order_id)]
@@ -633,7 +685,7 @@ class FakeGmo:
         row = self.broker.gmo_orders[str(order_id)]
         if time.time() < row["available_at"]:
             return {"status": 0, "data": []}
-        if not row.get("canceled") and self._evaluate_post_only(row):
+        if not row.get("canceled") and self._resync_post_only(row):
             await self.broker.persist()
         return {"status": 0, "data": [{
             "orderId": order_id, "size": str(row["filled"]), "price": str(row["price"]),
@@ -641,7 +693,7 @@ class FakeGmo:
 
     async def order(self, order_id: str) -> dict:
         row = self.broker.gmo_orders[str(order_id)]
-        if not row.get("canceled") and self._evaluate_post_only(row):
+        if not row.get("canceled") and self._resync_post_only(row):
             await self.broker.persist()
         if row.get("canceled"):
             status = "CANCELED"

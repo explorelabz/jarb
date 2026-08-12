@@ -20,11 +20,54 @@ const price = (value: number, tick: number) => new Intl.NumberFormat('ja-JP', {
 const blendedGmoFee = (config: SystemState['config']) => config.gmoMakerFeeBps * config.expectedPassiveFillRatio
   + config.gmoFeeBps * (1 - config.expectedPassiveFillRatio)
 
+const operatorTokenKey = 'jarb.operatorToken'
+const setOperatorToken = (token: string) => window.sessionStorage.setItem(operatorTokenKey, token.trim())
+const promptOperatorToken = (message = '输入操作员访问 Token') => {
+  const token = window.prompt(message)?.trim() ?? ''
+  if (token) setOperatorToken(token)
+  return token
+}
+
+async function authorizedFetch(path: string, init?: RequestInit, retry = true): Promise<Response> {
+  let token = window.sessionStorage.getItem(operatorTokenKey) ?? ''
+  if (!token) token = promptOperatorToken()
+  if (!token) throw new Error('需要操作员 Token')
+  const response = await fetch(path, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, ...init?.headers },
+  })
+  if (response.status === 401 && retry) {
+    window.sessionStorage.removeItem(operatorTokenKey)
+    const replacement = promptOperatorToken('Token 无效或已轮换，请重新输入操作员访问 Token')
+    if (!replacement) return response
+    return authorizedFetch(path, init, false)
+  }
+  return response
+}
+
 async function api(path: string, init?: RequestInit) {
-  const response = await fetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } })
+  const response = await authorizedFetch(path, {
+    ...init, headers: { 'Content-Type': 'application/json', ...init?.headers },
+  })
   const data = await response.json()
   if (!response.ok) throw new Error(data.error ?? data.detail ?? '请求失败')
   return data
+}
+
+async function downloadApi(path: string) {
+  const response = await authorizedFetch(path)
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}))
+    throw new Error(data.error ?? data.detail ?? '导出失败')
+  }
+  const blobUrl = URL.createObjectURL(await response.blob())
+  const disposition = response.headers.get('Content-Disposition') ?? ''
+  const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] ?? 'jarb-export'
+  const link = document.createElement('a')
+  link.href = blobUrl
+  link.download = filename
+  link.click()
+  URL.revokeObjectURL(blobUrl)
 }
 
 function Skeleton() {
@@ -160,8 +203,8 @@ function Trades({ state }: { state: SystemState }) {
       <div><span className="eyebrow">MATCHED EXECUTIONS</span><h2 id="trade-title">双边成交明细</h2></div>
       <div className="trade-head-actions">
         <span className="muted">最近 {state.trades.length} 笔 · BitTrade 成交 → GMO 反向对冲</span>
-        <a className="export-link" href="/api/orders/export?format=csv&amp;mode=all"><DownloadSimple size={15} />导出全部 CSV</a>
-        <a className="export-link" href="/api/orders/export?format=json&amp;mode=all"><DownloadSimple size={15} />JSON</a>
+        <button className="export-link" onClick={() => void downloadApi('/api/orders/export?format=csv&mode=all')}><DownloadSimple size={15} />导出全部 CSV</button>
+        <button className="export-link" onClick={() => void downloadApi('/api/orders/export?format=json&mode=all')}><DownloadSimple size={15} />JSON</button>
       </div>
     </div>
     {state.trades.length === 0 ? <div className="empty-state">
@@ -294,6 +337,7 @@ function Settings({ state, risk, onClose, onSaved }: { state: SystemState; risk:
       {state.mode === 'paper' && paperScenarios && <div className="settings-section">
         <div className="settings-title"><div><b>Paper 撮合与对冲</b><small>BitTrade 逐笔成交按队列位置撮合；以下开关只作用于模拟 GMO 对冲边界</small></div></div>
         <p className="field-note">穿价成交 {paperScenarios.matching?.throughFills ?? 0} · 同价排队命中 {paperScenarios.matching?.atLevelFills ?? 0} · 穿价占比 {((paperScenarios.matching?.throughRatio ?? 0) * 100).toFixed(1)}%</p>
+        <p className={(paperScenarios.matching?.gmoPassive?.fillsWithoutPublicTrade ?? 0) === 0 ? 'field-note' : 'field-error'}>GMO SOK 成交 {paperScenarios.matching?.gmoPassive?.fillEvents ?? 0} · 无公开成交驱动 {paperScenarios.matching?.gmoPassive?.fillsWithoutPublicTrade ?? 0}</p>
         <div className="paper-scenario-grid">
           {([
             ['gmoPartialFak', 'GMO FAK 部分成交'], ['delayedExecutions', 'GMO 成交延迟'],
@@ -400,14 +444,42 @@ export function App() {
   const [risk, setRisk] = useState<RiskStatus | null>(null)
 
   useEffect(() => {
-    let source: EventSource | undefined
-    const connect = () => {
-      source = new EventSource('/api/events')
-      source.onmessage = event => { setState(JSON.parse(event.data)); setError('') }
-      source.onerror = () => setError('与交易服务的实时连接已断开，正在重连…')
+    let stopped = false
+    let controller: AbortController | undefined
+    const connect = async () => {
+      while (!stopped) {
+        controller = new AbortController()
+        try {
+          const response = await authorizedFetch('/api/events', { signal: controller.signal })
+          if (!response.ok || !response.body) {
+            const data = await response.json().catch(() => ({}))
+            throw new Error(data.detail ?? '实时连接鉴权失败')
+          }
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let buffered = ''
+          while (!stopped) {
+            const { value, done } = await reader.read()
+            if (done) break
+            buffered += decoder.decode(value, { stream: true })
+            const frames = buffered.split('\n\n')
+            buffered = frames.pop() ?? ''
+            for (const frame of frames) {
+              const payload = frame.split('\n').filter(line => line.startsWith('data:'))
+                .map(line => line.slice(5).trimStart()).join('\n')
+              if (payload) { setState(JSON.parse(payload)); setError('') }
+            }
+          }
+        } catch (error) {
+          if (!stopped && !(error instanceof DOMException && error.name === 'AbortError')) {
+            setError(error instanceof Error ? error.message : '与交易服务的实时连接已断开，正在重连…')
+          }
+        }
+        if (!stopped) await new Promise(resolve => window.setTimeout(resolve, 1500))
+      }
     }
-    connect()
-    return () => source?.close()
+    void connect()
+    return () => { stopped = true; controller?.abort() }
   }, [])
 
   useEffect(() => {
@@ -439,11 +511,13 @@ export function App() {
       if (risk?.armed) {
         result = await api('/api/risk/disarm', { method: 'POST' })
       } else {
-        const actor = window.prompt(risk?.pendingArmActor ? `第一位操作员：${risk.pendingArmActor}。请输入第二位操作员标识` : '输入当前操作员标识')
-        if (!actor?.trim()) return
+        if (risk?.pendingArmActor) {
+          const token = promptOperatorToken(`第一位操作员：${risk.pendingArmActor}。请输入另一位操作员的访问 Token`)
+          if (!token) return
+        }
         const phrase = window.prompt('输入实盘确认短语')
         if (!phrase) return
-        result = await api('/api/risk/arm', { method: 'POST', body: JSON.stringify({ phrase, actor: actor.trim() }) })
+        result = await api('/api/risk/arm', { method: 'POST', body: JSON.stringify({ phrase }) })
       }
       setRisk(result)
     } catch (e) { setError(e instanceof Error ? e.message : '风控状态切换失败') }
@@ -508,7 +582,7 @@ export function App() {
           </div>
         </div>
         <div className="audit-section">
-          <div className="section-head"><div><span className="eyebrow">AUDIT TRAIL</span><h2>审计留痕</h2></div><a className="download" href="/api/reconciliation/export"><DownloadSimple size={17} />导出日结</a></div>
+          <div className="section-head"><div><span className="eyebrow">AUDIT TRAIL</span><h2>审计留痕</h2></div><button className="download" onClick={() => void downloadApi('/api/reconciliation/export')}><DownloadSimple size={17} />导出日结</button></div>
           <div className="event-list">{state.events.slice(0, 5).map(event => <div className={`event ${event.level}`} key={event.id}><i /> <span>{time(event.timestamp)}</span><b>{event.message}</b></div>)}</div>
         </div>
       </section>

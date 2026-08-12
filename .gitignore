@@ -1,6 +1,7 @@
 node_modules
 dist
 .env
+.deploy.env
 .venv
 .uv-cache
 .rust-dist

@@ -10,7 +10,7 @@ from backend.engine.domain import HedgeStatus, OrderState
 from backend.engine.paper_matcher import PublicTrade
 from backend.engine.state_store import StateStore
 from backend.models import (
-    ConnectionUpdate, MarketTop, PaperScenarioUpdate, RiskLimitsUpdate, StrategyConfig, utc_now,
+    ClientFill, ConnectionUpdate, MarketTop, PaperScenarioUpdate, RiskLimitsUpdate, StrategyConfig, utc_now,
 )
 from backend.service import TradingService
 
@@ -141,6 +141,39 @@ def paper_market_adapters() -> dict:
         "bittrade_depth_factory": FakeDepthFeed,
         "paper_trade_stream_factory": idle_public_trades,
     }
+
+
+@pytest.mark.asyncio
+async def test_execution_price_keeps_exchange_decimal_and_delta_breach_kills_risk_gate(tmp_path):
+    service = TradingService(
+        StrategyConfig(deltaLimit=.005), mode="paper", gmo=FakeGmo(), bittrade=FakeBittrade(),
+        db_path=tmp_path / "state.db",
+    )
+    await service.state_store.initialize()
+    service.risk_gate.kill_sentinel = tmp_path / "KILL"
+    await service.risk_gate.restore()
+    runtime = service.state.symbolStates["BTC_JPY"]
+    runtime.instrument.priceTick = .00000001
+    exact_market = MarketTop(
+        symbol="BTC_JPY", bid=float(Decimal("0.123456789")), ask=float(Decimal("0.123456799")),
+        bidSize=1, askSize=1, bidExact=Decimal("0.123456789"), askExact=Decimal("0.123456799"),
+        timestamp=utc_now(), source="GMO",
+    )
+    runtime.market = exact_market
+    service.market_feed.latest["BTC_JPY"] = exact_market
+    assert service._gmo_passive_price("BTC_JPY", "BUY") == Decimal("0.12345678")
+    assert service._gmo_passive_price("BTC_JPY", "SELL") == Decimal("0.12345680")
+
+    service.clients["BTC_JPY"] = [ClientFill(
+        id="C-DELTA", orderId="BT-DELTA", symbol="BTC_JPY", side="BUY",
+        price=100, size=.006, fee=0, role="maker", timestamp=utc_now(),
+    )]
+    await service._recalculate("BTC_JPY")
+    assert service.risk_gate.killed is True
+    assert service.state.killSwitch is True
+    assert "delta limit exceeded" in service.risk_gate.last_reason
+    await service.state_store.close()
+    await service.notifier.close()
 
 
 @pytest.mark.asyncio

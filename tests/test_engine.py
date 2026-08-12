@@ -14,7 +14,7 @@ from backend.engine.domain import HedgeStatus, OrderState
 from backend.engine.events import EventBus
 from backend.adapters import ExchangeAPIError
 from backend.engine.execution_gateway import ExecutionGateway
-from backend.engine.fill_tracker import BitTradeRestFillSource
+from backend.engine.fill_tracker import BitTradePrivateWS, BitTradeRestFillSource
 from backend.engine.hedge_worker import GmoHedgeExecutor, HedgeExecution, HedgeWorker
 from backend.engine.market_feed import GmoPublicWS, MarketFeed
 from backend.engine.quote_engine import QuoteEngine, RequotePolicy, WorkingQuote, target_price
@@ -53,6 +53,35 @@ async def test_cumulative_fills_are_database_idempotent(tmp_path):
     assert second and second.incremental_qty == Decimal("0.15")
     assert old is None
     assert (await store.open_orders())[0]["cumulative_filled"] == "0.35"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_fill_and_hedge_intent_are_atomic_and_legacy_gaps_are_backfilled(tmp_path):
+    path = tmp_path / "state.db"
+    store = StateStore(path)
+    await store.initialize()
+    await store.create_order("BTCJPY-BUY-ATOMIC", "BTC_JPY", "BUY", Decimal("1"), Decimal("100"))
+    await store.transition_order("BTCJPY-BUY-ATOMIC", OrderState.PLACING)
+    await store.transition_order("BTCJPY-BUY-ATOMIC", OrderState.OPEN, exchange_order_id="9001-A")
+    fill = await store.record_cumulative_fill(
+        client_order_id="BTCJPY-BUY-ATOMIC", order_id="9001-A", trade_id="T-ATOMIC",
+        symbol="BTC_JPY", side="BUY", cumulative_qty=Decimal("0.2"),
+        price=Decimal("100"), fee=Decimal("0"), occurred_at="2026-08-13T00:00:00Z",
+    )
+    assert fill is not None
+    pending = await store.pending_hedges()
+    assert len(pending) == 1
+    assert pending[0].client_fill_id == fill.fill_id
+    assert pending[0].side == "SELL"
+
+    # Simulate a database created by the old two-commit implementation.
+    with sqlite3.connect(path) as db:
+        db.execute("DELETE FROM hedge_intents WHERE client_fill_id=?", (fill.fill_id,))
+    assert not await store.pending_hedges()
+    assert await store.backfill_missing_hedge_intents() == 1
+    assert (await store.pending_hedges())[0].client_fill_id == fill.fill_id
+    assert await store.backfill_missing_hedge_intents() == 0
     await store.close()
 
 
@@ -370,6 +399,114 @@ async def test_account_level_match_sweep_uses_persisted_cursor(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_rest_match_sweep_recovers_missing_exchange_and_client_ids(tmp_path):
+    class MatchAdapter:
+        async def recent_matches(self, symbol=None, *, start_time=None):
+            return {"data": [{
+                "order-id": "EX-REST-1", "trade-id": "T-REST-1", "symbol": "btcjpy",
+                "side": "buy-limit-maker", "price": "100", "created-at": 2_000,
+            }]}
+
+        async def matches(self, order_id):
+            return {"data": [{
+                "trade-id": "T-REST-1", "filled-amount": "0.1", "price": "100",
+                "filled-fees": "0", "created-at": 2_000,
+            }]}
+
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    await store.create_order("BTCJPY-BUY-REST", "BTC_JPY", "BUY", Decimal("0.1"), Decimal("100"))
+    await store.transition_order("BTCJPY-BUY-REST", OrderState.PLACING)
+    await store.transition_order("BTCJPY-BUY-REST", OrderState.UNKNOWN)
+    events = await BitTradeRestFillSource(MatchAdapter(), store)()
+    assert len(events) == 1
+    assert events[0].client_order_id == "BTCJPY-BUY-REST"
+    assert events[0].order_id == "EX-REST-1"
+    assert (await store.order("BTCJPY-BUY-REST"))["exchange_order_id"] == "EX-REST-1"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_private_fill_without_client_id_recovers_unique_unknown_order(tmp_path):
+    class FillAdapter:
+        access_key = "key"
+        secret_key = "secret"
+        time_offset_sec = 0
+        HOST = "example.invalid"
+
+        async def order(self, order_id):
+            return {"data": {"field-amount": "0.2", "price": "100"}}
+
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    await store.create_order("BTCJPY-BUY-LOST-ID", "BTC_JPY", "BUY", Decimal("0.2"), Decimal("100"))
+    await store.transition_order("BTCJPY-BUY-LOST-ID", OrderState.PLACING)
+    await store.transition_order("BTCJPY-BUY-LOST-ID", OrderState.UNKNOWN)
+    source = BitTradePrivateWS(FillAdapter(), ["BTC_JPY"], store=store)
+    event = await source._trade_event({
+        "orderId": "EX-LOST-1", "tradeId": "T-LOST-1", "symbol": "btcjpy",
+        "orderSide": "buy", "tradePrice": "100", "tradeTime": 1_700_000_000_000,
+    })
+    assert event.client_order_id == "BTCJPY-BUY-LOST-ID"
+    assert event.cumulative_qty == Decimal("0.2")
+    assert (await store.order("BTCJPY-BUY-LOST-ID"))["exchange_order_id"] == "EX-LOST-1"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_private_fill_without_client_id_fails_closed_when_mapping_is_ambiguous(tmp_path):
+    class FillAdapter:
+        access_key = "key"
+        secret_key = "secret"
+        time_offset_sec = 0
+        HOST = "example.invalid"
+
+        async def order(self, order_id):
+            return {"data": {"field-amount": "0.1", "price": "100"}}
+
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    for suffix in ("A", "B"):
+        client_id = f"BTCJPY-BUY-AMBIG-{suffix}"
+        await store.create_order(client_id, "BTC_JPY", "BUY", Decimal("0.1"), Decimal("100"))
+        await store.transition_order(client_id, OrderState.PLACING)
+        await store.transition_order(client_id, OrderState.UNKNOWN)
+    source = BitTradePrivateWS(FillAdapter(), ["BTC_JPY"], store=store)
+    with pytest.raises(RuntimeError, match="no resolvable clientOrderId"):
+        await source._trade_event({
+            "orderId": "EX-AMBIG", "tradeId": "T-AMBIG", "symbol": "btcjpy",
+            "orderSide": "buy", "tradePrice": "100", "tradeTime": 1_700_000_000_000,
+        })
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type='fill.ws.unresolved' AND level='critical'"
+        ).fetchone()[0] == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_keeps_unknown_without_exchange_id_unresolved(tmp_path):
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    await store.create_order("BTCJPY-BUY-UNKNOWN", "BTC_JPY", "BUY", Decimal("0.1"), Decimal("100"))
+    await store.transition_order("BTCJPY-BUY-UNKNOWN", OrderState.PLACING)
+    await store.transition_order("BTCJPY-BUY-UNKNOWN", OrderState.UNKNOWN)
+    risk = RiskGate(store, confirmation_phrase="ARM", kill_sentinel=tmp_path / "KILL")
+    await risk.restore()
+    limiter = PriorityRateLimiter()
+    gateway = ExecutionGateway(FakeMakerVenue(), store, risk, limiter)
+    with pytest.raises(RuntimeError, match="manual reconciliation required"):
+        await gateway.cancel_all(timeout_sec=.05)
+    assert (await store.order("BTCJPY-BUY-UNKNOWN"))["state"] == OrderState.UNKNOWN
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type='orders.cancel_all.unresolved'"
+        ).fetchone()[0] == 1
+    await limiter.stop()
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_live_arm_requires_two_distinct_operators(tmp_path):
     store = StateStore(tmp_path / "state.db")
     await store.initialize()
@@ -474,6 +611,101 @@ async def test_gmo_terminal_status_does_not_turn_empty_execution_rows_into_dupli
 
 
 @pytest.mark.asyncio
+async def test_execute_group_recalculates_qty_after_retry_limit_filter(tmp_path):
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    intents = []
+    for suffix, qty in (("STALE", Decimal("0.3")), ("ACTIVE", Decimal("0.1"))):
+        client_id = f"BTCJPY-BUY-{suffix}"
+        await store.create_order(client_id, "BTC_JPY", "BUY", qty, Decimal("100"))
+        await store.transition_order(client_id, OrderState.PLACING)
+        await store.transition_order(client_id, OrderState.OPEN, exchange_order_id=f"BT-{suffix}")
+        fill = await store.record_cumulative_fill(
+            client_order_id=client_id, order_id=f"BT-{suffix}", trade_id=f"T-{suffix}",
+            symbol="BTC_JPY", side="BUY", cumulative_qty=qty, price=Decimal("100"),
+            fee=Decimal("0"), occurred_at="2026-08-13T00:00:00Z",
+        )
+        intents.append(next(
+            intent for intent in await store.pending_hedges()
+            if intent.client_fill_id == fill.fill_id
+        ))
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute("UPDATE hedge_intents SET attempts=4 WHERE id=?", (intents[0].id,))
+
+    submitted: list[Decimal] = []
+
+    async def execute(_symbol, _side, qty):
+        submitted.append(qty)
+        return HedgeExecution("GMO-ACTIVE", qty, qty * Decimal("101"))
+
+    risk = RiskGate(store, confirmation_phrase="ARM", kill_sentinel=tmp_path / "KILL")
+    await risk.restore()
+    worker = HedgeWorker(
+        store, EventBus(), execute, risk, min_sizes={"BTC_JPY": Decimal("0.1")}, max_attempts=4,
+    )
+    refreshed = await store.pending_hedges()
+    await worker._execute_group(("BTC_JPY", "SELL"), refreshed, Decimal("0.4"))
+    assert submitted == [Decimal("0.1")]
+    assert len(await store.escalated_hedges()) == 1
+    assert not await store.pending_hedges()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_checkpointed_fak_timeout_is_resolved_without_submitting_another_order(tmp_path):
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    await store.create_order("BTCJPY-BUY-FAK", "BTC_JPY", "BUY", Decimal("0.1"), Decimal("100"))
+    await store.transition_order("BTCJPY-BUY-FAK", OrderState.PLACING)
+    await store.transition_order("BTCJPY-BUY-FAK", OrderState.OPEN, exchange_order_id="BT-FAK")
+    await store.record_cumulative_fill(
+        client_order_id="BTCJPY-BUY-FAK", order_id="BT-FAK", trade_id="T-FAK",
+        symbol="BTC_JPY", side="BUY", cumulative_qty=Decimal("0.1"),
+        price=Decimal("100"), fee=Decimal("0"), occurred_at="2026-08-13T00:00:00Z",
+    )
+    intent = (await store.pending_hedges())[0]
+
+    class TimeoutAfterCheckpoint:
+        def __init__(self):
+            self.calls = 0
+            self.checkpoint = None
+
+        def set_checkpoint(self, callback):
+            self.checkpoint = callback
+
+        async def __call__(self, symbol, side, qty):
+            self.calls += 1
+            await self.checkpoint("GMO-FAK-1")
+            raise TimeoutError("executions temporarily delayed")
+
+    executor = TimeoutAfterCheckpoint()
+    resolved: list[str] = []
+
+    async def resolver(checkpointed):
+        resolved.append(checkpointed.exchange_order_id)
+        return HedgeExecution(
+            "GMO-FAK-1", Decimal("0.1"), Decimal("10"),
+            confirmed_at="2026-08-13T00:00:01Z",
+        )
+
+    risk = RiskGate(store, confirmation_phrase="ARM", kill_sentinel=tmp_path / "KILL")
+    worker = HedgeWorker(
+        store, EventBus(), executor, risk, min_sizes={"BTC_JPY": Decimal("0.1")},
+        resolver=resolver,
+    )
+    await worker._execute_group(("BTC_JPY", "SELL"), [intent], Decimal("0.1"))
+    inflight = (await store.pending_hedges())[0]
+    assert inflight.status == HedgeStatus.HEDGING
+    assert inflight.exchange_order_id == "GMO-FAK-1"
+
+    await worker._execute_group(("BTC_JPY", "SELL"), [inflight], Decimal("0.1"))
+    assert executor.calls == 1
+    assert resolved == ["GMO-FAK-1"]
+    assert not await store.pending_hedges()
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_gmo_sok_partial_fill_is_canceled_before_fak_fallback_and_uses_blended_fee():
     class HybridGmo:
         def __init__(self):
@@ -519,6 +751,8 @@ async def test_gmo_sok_partial_fill_is_canceled_before_fak_fallback_and_uses_ble
     )
     execution = await executor("BTC_JPY", "SELL", Decimal("0.1"))
     assert adapter.market_sizes == [Decimal("0.04")]
+    assert execution.order_id == "M-1"
+    assert "+" not in execution.order_id
     assert execution.filled_qty == Decimal("0.10")
     assert execution.filled_notional == Decimal("10.14")
     assert execution.fee_jpy == Decimal("6.06") * Decimal("-1") / Decimal("10000") \
@@ -530,6 +764,8 @@ async def test_gmo_sok_partial_fill_is_canceled_before_fak_fallback_and_uses_ble
 async def test_gmo_public_ws_serializes_subscriptions_and_publishes_best_level(monkeypatch):
     sent: list[dict] = []
     delays: list[float] = []
+    trades = []
+    trade_seen = asyncio.Event()
     block = asyncio.Event()
 
     class FakeSocket:
@@ -544,6 +780,10 @@ async def test_gmo_public_ws_serializes_subscriptions_and_publishes_best_level(m
                 "channel": "orderbooks", "symbol": "BTC", "timestamp": "2026-08-10T00:00:00Z",
                 "bids": [{"price": "100", "size": "2"}],
                 "asks": [{"price": "101", "size": "3"}],
+            })
+            yield json.dumps({
+                "channel": "trades", "symbol": "BTC", "timestamp": "2026-08-10T00:00:00.125Z",
+                "price": "100", "size": "0.2", "side": "SELL",
             })
             await block.wait()
 
@@ -562,16 +802,31 @@ async def test_gmo_public_ws_serializes_subscriptions_and_publishes_best_level(m
     events = EventBus()
     feed = MarketFeed(object(), events)
     queue = events.open_queue("market.updated")
-    task = asyncio.create_task(GmoPublicWS(["BTC", "ETH"], feed).run())
+    async def on_trade(trade):
+        trades.append(trade)
+        trade_seen.set()
+
+    task = asyncio.create_task(GmoPublicWS(["BTC", "ETH"], feed, on_trade=on_trade).run())
     event = await asyncio.wait_for(queue.get(), timeout=.2)
+    await asyncio.wait_for(trade_seen.wait(), timeout=.2)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert [row["symbol"] for row in sent[:2]] == ["BTC", "ETH"]
-    assert delays[:2] == [1.1, 1.1]
+    assert [(row["symbol"], row["channel"]) for row in sent[:4]] == [
+        ("BTC", "orderbooks"), ("ETH", "orderbooks"),
+        ("BTC", "trades"), ("ETH", "trades"),
+    ]
+    assert sent[2]["option"] == "TAKER_ONLY"
+    assert delays[:4] == [1.1, 1.1, 1.1, 1.1]
     assert event.payload.bid == 100
     assert event.payload.askSize == 3
+    assert event.payload.decimal_bid() == Decimal("100")
+    assert event.payload.decimal_asks() == [(Decimal("101"), Decimal("3"))]
     assert feed.latest_transport["BTC_JPY"] == "ws"
+    assert trades[0].symbol == "BTC_JPY"
+    assert trades[0].taker_side == "SELL"
+    assert trades[0].qty == Decimal("0.2")
+    assert trades[0].ts_ms == 1786320000125
 
 
 @pytest.mark.asyncio

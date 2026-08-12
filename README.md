@@ -15,7 +15,7 @@ BitTrade 私有 WS → FillTracker → HedgeWorker → GMO SOK(Post-Only) → �
                           └──── SQLite WAL StateStore
 ```
 
-组件之间使用事件总线通信，订单、成交、余额、审计和对冲意图先写入 SQLite WAL，再执行外部副作用。Python 负责网络 I/O 和业务编排，Rust 负责计算热路径。数量对账在 Rust 内部转换为 `1e-8` 定点整数，避免浮点累计造成伪差额。
+组件之间使用事件总线通信，订单、余额和审计先写入 SQLite WAL，再执行外部副作用；每笔成交与对应的反向对冲意图在同一个 SQLite 事务中提交。Python 负责网络 I/O 和业务编排，Rust 负责计算热路径。数量对账在 Rust 内部转换为 `1e-8` 定点整数，避免浮点累计造成伪差额。
 
 ## 已实现
 
@@ -59,6 +59,14 @@ npm run dev
 ```
 
 打开 <http://127.0.0.1:5173>。默认运行 Paper 模式，不需要 API Key。Paper 会自动完成恢复、以 `ARM JARB PAPER` 走完整 Arm 门禁，然后由 Fake 交易所撮合真实引擎挂单。设置页可开关部分成交、dust、重复/乱序、撤单竞速、GMO 部分 FAK、成交延迟、post-only 拒单、429 与网络超时等故障注入。
+
+控制面必须配置具名操作员 Token，除 `/api/health` 外的所有 API、SSE 和导出均要求 `Authorization: Bearer <token>`。控制台首次打开会提示输入 Token，并仅保存在当前标签页的 `sessionStorage`；不要把 Token 放进 URL：
+
+```dotenv
+JARB_OPERATOR_TOKENS="alice=<至少32字符的随机token>,bob=<另一个至少32字符的随机token>"
+```
+
+每个 Token 必须唯一绑定一个真实操作员。启用双人 Arm 时，第二次确认必须换用另一位操作员的 Token；请求体里的自报姓名不会被接受。
 
 API Key 也可继续通过环境变量注入：
 
@@ -109,7 +117,7 @@ npm run build
 
 `TRADING_MODE=live` 只连接真实行情和私有查询，进程每次启动都强制回到 `DISARMED`。启动恢复会校准交易所时间、核对本地与 BitTrade 未结订单、补拉成交并处理未决对冲；发现非本系统订单或无法确认的 GMO 对冲时不会开放 Arm。
 
-默认要求两位不同操作员在 5 分钟内依次输入 `ARM_CONFIRMATION_PHRASE`，才会临时开放自动撤挂单；默认 60 分钟后自动 Disarm。单笔、日成交、日亏损、Delta、对冲失败与延迟限额可通过 `/api/risk/limits` 或界面调整，修改时会先 Disarm。Pause、Disarm、kill、行情超过 `staleMarketMs` 或任一风险限额触发，都会停止报价并执行 cancel-all 后轮询到未结订单为空。创建 `data/KILL` 可从进程外触发急停；移除文件并在 UI 解除 kill 后仍需重新恢复和 Arm。
+默认要求两个不同的已认证操作员在 5 分钟内依次输入 `ARM_CONFIRMATION_PHRASE`，才会临时开放自动撤挂单；身份来自各自唯一的 `JARB_OPERATOR_TOKENS`，不信任请求体自报的 actor。默认 60 分钟后自动 Disarm。单笔、日成交、日亏损、Delta、对冲失败与延迟限额可通过 `/api/risk/limits` 或界面调整，修改时会先 Disarm。Pause、Disarm、kill、行情超过 `staleMarketMs` 或任一风险限额触发，都会停止报价并执行 cancel-all 后轮询到未结订单为空。创建 `data/KILL` 可从进程外触发急停；移除文件并在 UI 解除 kill 后仍需重新恢复和 Arm。
 
 这是会提交真实订单的交易软件。首次使用必须在隔离的小额账户验证 API 权限、最小下单量、手续费、余额字段和交易所维护时行为；SQLite 适用于单机运行，不支持两个实例同时管理同一账户。
 
@@ -121,7 +129,7 @@ npm run build
 - `GET/PATCH /api/paper/scenarios`：查询或动态修改 Paper 撮合故障开关与概率。
 - `POST /api/paper/fill`：向 FakeBitTrade 当前挂单注入一笔成交，仍通过 FillTracker 与 HedgeWorker 处理。
 - `GET /api/risk`：返回 Arm、恢复、kill 和自动 Disarm 原因。
-- `POST /api/risk/arm`：提交确认短语与操作者，限时开放实盘执行。
+- `POST /api/risk/arm`：已认证操作员提交确认短语，限时开放实盘执行；操作者身份只取 Bearer Token。
 - `POST /api/risk/disarm`：撤销实盘权限并撤销所有未结挂单。
 - `GET /api/inventory`：返回两家交易所的多资产底仓额度、禁用币对与脱敏 Webhook 状态。
 - `PATCH /api/inventory`：更新 BitTrade/GMO 底仓与 Lark Webhook；资产金额为 0 会立即禁用相关币对。

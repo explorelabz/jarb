@@ -30,6 +30,9 @@ async def test_gmo_market_top_uses_real_best_level_depth():
     assert market.askSize == .0567
     assert market.bids == [(17400000.0, .1234)]
     assert market.asks == [(17410000.0, .0567)]
+    assert market.decimal_bid() == Decimal("17400000")
+    assert market.decimal_asks() == [(Decimal("17410000"), Decimal("0.0567"))]
+    assert "bidExact" not in market.model_dump()
 
 
 @pytest.mark.asyncio

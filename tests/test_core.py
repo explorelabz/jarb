@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import importlib
+import sys
+
 import pytest
 
+import backend.core as core_module
 from backend.core import make_quotes, matched_trade, opposite_side, reconcile, validate_config
 from backend.models import ClientFill, HedgeFill, MarketTop, StrategyConfig, gmo_taker_bps
 
@@ -78,3 +82,20 @@ def test_gmo_taker_fee_is_selected_per_base_asset():
     assert gmo_taker_bps("btc") == 5
     assert gmo_taker_bps("DAI") == 5
     assert gmo_taker_bps("DOGE") == 9
+
+
+def test_core_imports_and_operates_without_optional_rust_extension(monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, "hedge_core", None)
+        fallback = importlib.reload(core_module)
+        assert fallback.core_runtime() == "Python/Decimal fallback"
+        quotes = fallback.make_quotes(
+            MarketTop(
+                symbol="DOGE_JPY", bid=24.123, ask=24.127, bidSize=100, askSize=100,
+                timestamp="", source="GMO",
+            ),
+            config(maxQuoteSize=10, spreadBps=10),
+            price_tick=.001,
+        )
+        assert [quote.price for quote in quotes] == [24.098, 24.152]
+    importlib.reload(core_module)

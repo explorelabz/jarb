@@ -17,7 +17,7 @@ from .config import Credentials
 from .core import make_quotes, matched_trade, reconcile, validate_config
 from .engine.balance import BalanceCache
 from .engine.alerting import LarkWebhookNotifier
-from .engine.domain import EventType, FillDelta
+from .engine.domain import EventType, FillDelta, HedgePreconditionError
 from .engine.events import EventBus
 from .engine.execution_gateway import ExecutionGateway
 from .engine.fill_tracker import BitTradePrivateWS, BitTradeRestFillSource, FillTracker
@@ -143,12 +143,15 @@ class TradingService:
         self.market_bittrade = market_bittrade or self.bittrade
         self._market_stream_factory = market_stream_factory or (
             (lambda bases, feed: self.market_gmo.market_stream(bases, feed)) if hasattr(self.market_gmo, "market_stream")
-            else (lambda bases, feed: GmoPublicWS(bases, feed).run())
+            else (lambda bases, feed: GmoPublicWS(
+                bases, feed,
+                on_trade=getattr(self.gmo, "on_public_trade", None) if mode == "paper" else None,
+            ).run())
         )
         self._private_stream_factory = private_stream_factory or (
             (lambda adapter, symbols, **callbacks: adapter.stream()) if hasattr(self.bittrade, "stream")
             else (lambda adapter, symbols, **callbacks: BitTradePrivateWS(
-                adapter, symbols, **callbacks,
+                adapter, symbols, store=self.state_store, **callbacks,
             ).stream())
         )
         self._bittrade_depth_factory = bittrade_depth_factory or BitTradeDepthFeed
@@ -530,6 +533,11 @@ class TradingService:
         }
         matching["publicDepth"] = self.bittrade_depth_feed.status() \
             if self.bittrade_depth_feed is not None and hasattr(self.bittrade_depth_feed, "status") else {}
+        matching["gmoPassive"] = self.gmo.passive_stats() \
+            if hasattr(self.gmo, "passive_stats") else {
+                "publicTradesSeen": 0, "fillEvents": 0, "fillQty": "0",
+                "fillsWithoutPublicTrade": 0,
+            }
         matching["risk"] = {
             "observations": self._paper_risk_observations,
             "wouldReject": self._paper_risk_would_reject,
@@ -551,7 +559,7 @@ class TradingService:
         await self._record("warning", "paper.scenarios.updated", "Paper 撮合坏情况开关已更新", result.model_dump())
         return self.paper_scenario_summary()
 
-    async def control(self, action: str) -> None:
+    async def control(self, action: str, actor: str = "operator") -> None:
         if action == "resume":
             if self.state.killSwitch:
                 raise ValueError("紧急停止仍处于启用状态")
@@ -567,12 +575,12 @@ class TradingService:
             raise ValueError("未知控制指令")
         if self._engine_ready:
             if action == "pause":
-                await self.disarm("operator paused quoting", "operator")
+                await self.disarm("operator paused quoting", actor)
             elif action == "kill":
-                await self.risk_gate.kill("operator kill switch", "operator")
+                await self.risk_gate.kill("operator kill switch", actor)
                 await self._cancel_all_live()
             elif action == "reset-kill":
-                await self.risk_gate.reset_kill("operator")
+                await self.risk_gate.reset_kill(actor)
                 await RecoveryCoordinator(
                     self.state_store, self.risk_gate, gateway=self.execution_gateway,
                     gmo=self.gmo,
@@ -800,7 +808,7 @@ class TradingService:
         available = limit - delta if side == "BUY" else limit + delta
         return max(Decimal("0"), available)
 
-    def _recalculate(self, symbol: str) -> None:
+    async def _recalculate(self, symbol: str) -> None:
         runtime = self.state.symbolStates[symbol]
         full_history = self.matched_trades[symbol]
         runtime.reconciliation = reconcile(symbol, self.clients[symbol], self.hedges[symbol])
@@ -822,6 +830,12 @@ class TradingService:
         if abs(runtime.reconciliation.delta) > runtime.config.deltaLimit:
             self.state.killSwitch = True
             self.state.running = False
+            if not self.risk_gate.killed:
+                await self.risk_gate.kill(
+                    f"{symbol} delta limit exceeded: {runtime.reconciliation.delta}",
+                    "system",
+                )
+                await self._cancel_all_live()
 
     def _sync_primary(self) -> None:
         if not self.state.activeSymbols:
@@ -1099,12 +1113,12 @@ class TradingService:
         runtime = self.state.symbolStates.get(symbol)
         market = self.market_feed.latest.get(symbol) or (runtime.market if runtime else None)
         if runtime is None or market is None:
-            raise RuntimeError(f"{symbol} 没有可用于 SOK 对冲的 GMO 行情")
+            raise HedgePreconditionError(f"{symbol} 没有可用于 SOK 对冲的 GMO 行情")
         if self.market_feed.latest.get(symbol) is not None \
                 and self.market_feed.age_ms(symbol) > runtime.config.staleMarketMs:
-            raise RuntimeError(f"{symbol} GMO 行情过期，拒绝提交 SOK 对冲")
+            raise HedgePreconditionError(f"{symbol} GMO 行情过期，拒绝提交 SOK 对冲")
         tick = Decimal(str(runtime.instrument.priceTick))
-        raw = Decimal(str(market.bid if side == "BUY" else market.ask))
+        raw = market.decimal_bid() if side == "BUY" else market.decimal_ask()
         rounding = ROUND_DOWN if side == "BUY" else ROUND_UP
         return (raw / tick).to_integral_value(rounding=rounding) * tick
 
@@ -1357,9 +1371,10 @@ class TradingService:
             for quote in targets:
                 key = (symbol, quote.side)
                 depth = Decimal(str(quote.size))
-                gmo_hedge_price = Decimal(str(
-                    runtime.market.bid if quote.side == "BUY" else runtime.market.ask
-                ))
+                gmo_hedge_price = (
+                    runtime.market.decimal_bid() if quote.side == "BUY"
+                    else runtime.market.decimal_ask()
+                )
                 required_edge = Decimal(str(max(
                     runtime.config.spreadBps,
                     runtime.config.bittradeMakerFeeBps
@@ -1397,7 +1412,8 @@ class TradingService:
                     ),
                     hedge_depth=depth,
                 )
-                size = Decimal(str(self._floor_size(float(capacity), runtime.instrument.sizeStep)))
+                size_step = Decimal(str(runtime.instrument.sizeStep))
+                size = (capacity / size_step).to_integral_value(rounding=ROUND_DOWN) * size_step
                 if size < Decimal(str(runtime.instrument.minOrderSize)):
                     if current:
                         await self.execution_gateway.cancel(current)
@@ -1568,7 +1584,7 @@ class TradingService:
             self.hedges[target] = hedges
             self.matched_trades[target] = trades
             runtime.trades = list(reversed(trades[-50:]))
-            self._recalculate(target)
+            await self._recalculate(target)
         pending_symbols = {intent.symbol for intent in await self.state_store.pending_hedges()}
         for target, runtime in self.state.symbolStates.items():
             if target in pending_symbols:
@@ -1650,7 +1666,7 @@ class TradingService:
         base_asset = symbol.removesuffix("_JPY")
         runtime = self.state.symbolStates.get(symbol)
         if runtime is not None and execution.filled_qty > 0:
-            reference = Decimal(str(runtime.market.ask if side == "BUY" else runtime.market.bid))
+            reference = runtime.market.decimal_ask() if side == "BUY" else runtime.market.decimal_bid()
             actual = execution.filled_notional / execution.filled_qty
             if reference > 0:
                 realized_bps = abs(actual - reference) / reference * Decimal("10000")

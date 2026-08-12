@@ -257,6 +257,46 @@ async def test_paper_gateway_observes_risk_limit_without_blocking_order(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_paper_risk_audit_deduplicates_reason_per_symbol(tmp_path):
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    risk = RiskGate(store, confirmation_phrase="ARM", kill_sentinel=tmp_path / "KILL")
+    await risk.restore()
+    await risk.mark_recovery_complete()
+    await risk.arm("ARM", "tester")
+    limiter = PriorityRateLimiter()
+    matcher = PaperMatchingEngine(FillTracker(store, EventBus()), MemoryDepth())
+    gateway = ExecutionGateway(ForbiddenVenue(), store, risk, limiter, paper_engine=matcher)
+
+    await gateway.place(
+        symbol="BTC_JPY", side="SELL", qty=Decimal("3000"), price=Decimal("100"),
+        size_step=Decimal(".1"), price_tick=Decimal("1"), snapshot=RiskSnapshot(),
+    )
+    await gateway.place(
+        symbol="ETH_JPY", side="SELL", qty=Decimal("1"), price=Decimal("100"),
+        size_step=Decimal(".1"), price_tick=Decimal("1"),
+        snapshot=RiskSnapshot(market_age_ms=2, stale_market_ms=1),
+    )
+    await gateway.place(
+        symbol="BTC_JPY", side="SELL", qty=Decimal("3000"), price=Decimal("100"),
+        size_step=Decimal(".1"), price_tick=Decimal("1"), snapshot=RiskSnapshot(),
+    )
+
+    stats = gateway.paper_risk_stats()
+    assert stats["lastReasonBySymbol"] == {
+        "BTC_JPY": "single order limit exceeded",
+        "ETH_JPY": "market data stale",
+    }
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        audit_count = db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type='risk.paper.would_reject'",
+        ).fetchone()[0]
+    assert audit_count == 2
+    await limiter.stop()
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_stale_depth_has_retryable_paper_error_code(tmp_path):
     class StaleDepth:
         def levels(self, _symbol, _side):

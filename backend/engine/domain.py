@@ -5,6 +5,10 @@ from decimal import Decimal
 from enum import StrEnum
 
 
+class HedgePreconditionError(RuntimeError):
+    """A local safety check failed before an exchange order was submitted."""
+
+
 class OrderState(StrEnum):
     NEW = "NEW"
     PLACING = "PLACING"

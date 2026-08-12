@@ -4,8 +4,10 @@ from typing import TYPE_CHECKING
 
 try:
     import hedge_core as native
-except ImportError as exc:  # pragma: no cover - startup guard
-    raise RuntimeError("Rust 核心未安装，请运行 npm run rust:build") from exc
+    NATIVE_CORE_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised in an isolated import test
+    from . import core_fallback as native
+    NATIVE_CORE_AVAILABLE = False
 
 from .models import (
     ClientFill, HedgeFill, MarketTop, MatchedTrade, QuoteLevel, Reconciliation,
@@ -14,6 +16,10 @@ from .models import (
 
 if TYPE_CHECKING:
     from typing import Literal
+
+
+def core_runtime() -> str:
+    return "Rust/PyO3" if NATIVE_CORE_AVAILABLE else "Python/Decimal fallback"
 
 
 def validate_config(config: StrategyConfig) -> float:

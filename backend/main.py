@@ -6,15 +6,18 @@ import io
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from .auth import authenticate_request, current_operator
 
 from .config import (
     credentials, gmo_fee_overrides, gmo_maker_fee_overrides, requested_mode,
     require_dual_arm_approval, risk_limits,
     strategy_config,
 )
+from .core import core_runtime
 from .models import (
     ArmRequest, ConnectionUpdate, ControlRequest, InventoryUpdate, PaperFillRequest,
     PaperScenarioUpdate, RiskLimitsUpdate,
@@ -36,7 +39,10 @@ async def lifespan(_: FastAPI):
     await service.stop()
 
 
-app = FastAPI(title="BitTrade/GMO Market Maker", version="0.2.0", lifespan=lifespan)
+app = FastAPI(
+    title="BitTrade/GMO Market Maker", version="0.2.0", lifespan=lifespan,
+    dependencies=[Depends(authenticate_request)],
+)
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["GET", "POST", "PATCH"], allow_headers=["*"])
 
 
@@ -86,9 +92,9 @@ async def update_connection(update: ConnectionUpdate):
 
 
 @app.post("/api/control")
-async def control(request: ControlRequest):
+async def control(request: ControlRequest, actor: str = Depends(current_operator)):
     try:
-        await service.control(request.action)
+        await service.control(request.action, actor=actor)
         return service.state
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -110,16 +116,16 @@ async def update_risk_limits(update: RiskLimitsUpdate):
 
 
 @app.post("/api/risk/arm")
-async def arm(request: ArmRequest):
+async def arm(request: ArmRequest, actor: str = Depends(current_operator)):
     try:
-        return await service.arm(request.phrase, request.actor)
+        return await service.arm(request.phrase, actor)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/risk/disarm")
-async def disarm():
-    return await service.disarm("operator requested disarm", "operator")
+async def disarm(actor: str = Depends(current_operator)):
+    return await service.disarm("operator requested disarm", actor)
 
 
 @app.get("/api/inventory")
@@ -197,4 +203,4 @@ async def export_orders(format: str = "csv", mode: str = "all"):
 @app.get("/api/health")
 async def health():
     return {"ok": True, "mode": service.state.mode, "connection": service.state.connection.status,
-            "activeSymbols": service.state.activeSymbols, "runtime": "Python", "core": "Rust/PyO3"}
+            "activeSymbols": service.state.activeSymbols, "runtime": "Python", "core": core_runtime()}

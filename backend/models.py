@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Side = Literal["BUY", "SELL"]
 
@@ -63,8 +64,26 @@ class MarketTop(BaseModel):
     askSize: float
     bids: list[tuple[float, float]] = Field(default_factory=list)
     asks: list[tuple[float, float]] = Field(default_factory=list)
+    # The public API remains numeric/JSON-compatible, while execution paths can
+    # retain the exchange's original decimal strings without an f64 round trip.
+    bidExact: Decimal | None = Field(default=None, exclude=True)
+    askExact: Decimal | None = Field(default=None, exclude=True)
+    bidsExact: list[tuple[Decimal, Decimal]] = Field(default_factory=list, exclude=True)
+    asksExact: list[tuple[Decimal, Decimal]] = Field(default_factory=list, exclude=True)
     timestamp: str
     source: Literal["GMO", "SIM"]
+
+    def decimal_bid(self) -> Decimal:
+        return self.bidExact if self.bidExact is not None else Decimal(str(self.bid))
+
+    def decimal_ask(self) -> Decimal:
+        return self.askExact if self.askExact is not None else Decimal(str(self.ask))
+
+    def decimal_bids(self) -> list[tuple[Decimal, Decimal]]:
+        return self.bidsExact or [(Decimal(str(price)), Decimal(str(qty))) for price, qty in self.bids]
+
+    def decimal_asks(self) -> list[tuple[Decimal, Decimal]]:
+        return self.asksExact or [(Decimal(str(price)), Decimal(str(qty))) for price, qty in self.asks]
 
 
 class QuoteLevel(BaseModel):
@@ -229,8 +248,9 @@ class ControlRequest(BaseModel):
 
 
 class ArmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     phrase: str = Field(min_length=1, max_length=128)
-    actor: str = Field(default="operator", min_length=1, max_length=128)
 
 
 class RiskLimitsUpdate(BaseModel):
