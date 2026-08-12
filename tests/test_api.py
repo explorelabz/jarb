@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import httpx
 import pytest
 
@@ -13,6 +14,7 @@ from backend.main import app
 ALICE_TOKEN = "alice-token-0123456789abcdef0123456789abcdef"
 BOB_TOKEN = "bob-token-0123456789abcdef0123456789abcdef"
 AUTH = {"Authorization": f"Bearer {ALICE_TOKEN}"}
+BOB_AUTH = {"Authorization": f"Bearer {BOB_TOKEN}"}
 
 
 @pytest.mark.asyncio
@@ -22,14 +24,22 @@ async def test_health_and_paper_mode_exposes_live_market_source(monkeypatch):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             health = (await client.get("/api/health")).json()
-            assert health["runtime"] == "Python"
-            assert health["core"] == "Rust/PyO3"
-            missing_confirmation = await client.patch(
-                "/api/connection", json={"mode": "live"}, headers=AUTH,
-            )
-            assert missing_confirmation.status_code == 400
+            assert health == {"ok": True}
 
-            configured = await client.patch("/api/connection", headers=AUTH, json={
+            async def approved_connection(payload):
+                requested = await client.patch("/api/connection", headers=AUTH, json=payload)
+                assert requested.status_code == 202
+                approval_id = requested.json()["approvalId"]
+                approved = await client.post(
+                    f"/api/approvals/{approval_id}/approve", headers=BOB_AUTH,
+                )
+                assert approved.status_code == 200
+                return await client.patch(
+                    "/api/connection", headers={**AUTH, "X-JARB-Approval": approval_id},
+                    json=payload,
+                )
+
+            configured = await approved_connection({
                 "mode": "paper",
                 "gmoApiKey": "gmo-public-1234",
                 "gmoSecretKey": "gmo-secret-value",
@@ -45,6 +55,7 @@ async def test_health_and_paper_mode_exposes_live_market_source(monkeypatch):
 
             state = (await client.get("/api/state", headers=AUTH)).json()
             assert state["mode"] == "paper"
+            assert state["runtime"]["core"] in ("Rust/PyO3", "Python/Decimal fallback")
             assert state["market"]["source"] == "GMO"
             manual_fill = await client.post("/api/paper/fill", headers=AUTH, json={
                 "symbol": "BTC_JPY", "side": "BUY", "size": .001, "role": "maker",
@@ -56,7 +67,41 @@ async def test_health_and_paper_mode_exposes_live_market_source(monkeypatch):
             assert "trading_mode,client_order_id" in order_csv.text
             assert "attachment; filename=jarb-orders-paper.csv" in order_csv.headers["content-disposition"]
 
-            cleared = await client.patch("/api/connection", headers=AUTH, json={
+            limits_payload = {"maxSingleOrderJpy": 240000}
+            limits_request = await client.patch(
+                "/api/risk/limits", headers=AUTH, json=limits_payload,
+            )
+            assert limits_request.status_code == 202
+            limits_approval = limits_request.json()["approvalId"]
+            assert (await client.post(
+                f"/api/approvals/{limits_approval}/approve", headers=AUTH,
+            )).status_code == 409
+            assert (await client.post(
+                f"/api/approvals/{limits_approval}/approve", headers=BOB_AUTH,
+            )).status_code == 200
+            limits_updated = await client.patch(
+                "/api/risk/limits",
+                headers={**AUTH, "X-JARB-Approval": limits_approval},
+                json=limits_payload,
+            )
+            assert limits_updated.status_code == 200
+            assert limits_updated.json()["maxSingleOrderJpy"] == 240000
+
+            scenarios_updated = await client.patch(
+                "/api/paper/scenarios", headers=AUTH, json={"seed": 13},
+            )
+            assert scenarios_updated.status_code == 200
+            with sqlite3.connect(main.service.state_store.path) as db:
+                assert db.execute(
+                    "SELECT actor FROM audit_events WHERE event_type='risk.limits.updated' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()[0] == "alice"
+                assert db.execute(
+                    "SELECT actor FROM audit_events WHERE event_type='paper.scenarios.updated' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()[0] == "alice"
+
+            cleared = await approved_connection({
                 "mode": "paper", "clearGmoCredentials": True, "clearBittradeCredentials": True,
             })
             assert cleared.json()["gmoConfigured"] is True

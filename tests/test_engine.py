@@ -3,7 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import subprocess
+import sys
+import textwrap
+import time
+from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 import httpx
@@ -404,13 +410,13 @@ async def test_rest_match_sweep_recovers_missing_exchange_and_client_ids(tmp_pat
         async def recent_matches(self, symbol=None, *, start_time=None):
             return {"data": [{
                 "order-id": "EX-REST-1", "trade-id": "T-REST-1", "symbol": "btcjpy",
-                "side": "buy-limit-maker", "price": "100", "created-at": 2_000,
+                    "side": "buy-limit-maker", "price": "100", "created-at": int(time.time() * 1000),
             }]}
 
         async def matches(self, order_id):
             return {"data": [{
                 "trade-id": "T-REST-1", "filled-amount": "0.1", "price": "100",
-                "filled-fees": "0", "created-at": 2_000,
+                "filled-fees": "0", "created-at": int(time.time() * 1000),
             }]}
 
     store = StateStore(tmp_path / "state.db")
@@ -445,7 +451,7 @@ async def test_private_fill_without_client_id_recovers_unique_unknown_order(tmp_
     source = BitTradePrivateWS(FillAdapter(), ["BTC_JPY"], store=store)
     event = await source._trade_event({
         "orderId": "EX-LOST-1", "tradeId": "T-LOST-1", "symbol": "btcjpy",
-        "orderSide": "buy", "tradePrice": "100", "tradeTime": 1_700_000_000_000,
+        "orderSide": "buy", "tradePrice": "100", "tradeTime": int(time.time() * 1000),
     })
     assert event.client_order_id == "BTCJPY-BUY-LOST-ID"
     assert event.cumulative_qty == Decimal("0.2")
@@ -475,12 +481,28 @@ async def test_private_fill_without_client_id_fails_closed_when_mapping_is_ambig
     with pytest.raises(RuntimeError, match="no resolvable clientOrderId"):
         await source._trade_event({
             "orderId": "EX-AMBIG", "tradeId": "T-AMBIG", "symbol": "btcjpy",
-            "orderSide": "buy", "tradePrice": "100", "tradeTime": 1_700_000_000_000,
+            "orderSide": "buy", "tradePrice": "100", "tradeTime": int(time.time() * 1000),
         })
     with sqlite3.connect(tmp_path / "state.db") as db:
         assert db.execute(
             "SELECT COUNT(*) FROM audit_events WHERE event_type='fill.ws.unresolved' AND level='critical'"
         ).fetchone()[0] == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_private_fill_recovery_refuses_unknown_order_outside_time_window(tmp_path):
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    await store.create_order("BTCJPY-BUY-OLD", "BTC_JPY", "BUY", Decimal("0.1"), Decimal("100"))
+    await store.transition_order("BTCJPY-BUY-OLD", OrderState.PLACING)
+    await store.transition_order("BTCJPY-BUY-OLD", OrderState.UNKNOWN)
+    resolved = await store.resolve_client_order_for_exchange_fill(
+        "EX-FUTURE", symbol="BTC_JPY", side="BUY", price=Decimal("100"),
+        occurred_at="2030-01-01T00:00:00Z", window_sec=600,
+    )
+    assert resolved is None
+    assert (await store.order("BTCJPY-BUY-OLD"))["exchange_order_id"] is None
     await store.close()
 
 
@@ -652,6 +674,241 @@ async def test_execute_group_recalculates_qty_after_retry_limit_filter(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_response_lost_fak_is_recovered_from_gmo_history_without_resubmission(tmp_path):
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    await store.create_order("BTCJPY-BUY-ORPHAN", "BTC_JPY", "BUY", Decimal("0.1"), Decimal("100"))
+    await store.transition_order("BTCJPY-BUY-ORPHAN", OrderState.PLACING)
+    await store.transition_order("BTCJPY-BUY-ORPHAN", OrderState.OPEN, exchange_order_id="BT-ORPHAN")
+    fill = await store.record_cumulative_fill(
+        client_order_id="BTCJPY-BUY-ORPHAN", order_id="BT-ORPHAN", trade_id="T-ORPHAN",
+        symbol="BTC_JPY", side="BUY", cumulative_qty=Decimal("0.1"),
+        price=Decimal("100"), fee=Decimal("0"), occurred_at=datetime.now(timezone.utc).isoformat(),
+    )
+    intent = next(item for item in await store.pending_hedges() if item.client_fill_id == fill.fill_id)
+    intent = await store.transition_hedge(intent.id, HedgeStatus.HEDGING)
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    submission = await store.prepare_hedge_submission(
+        [intent.id], symbol="BTC_JPY", side="SELL", qty=Decimal("0.1"),
+        execution_type="FAK", submitted_at=submitted_at,
+    )
+
+    class RecoveryGmo:
+        market_orders = 0
+
+        async def market_order(self, *args):
+            self.market_orders += 1
+            raise AssertionError("recovery must not submit another FAK")
+
+        async def latest_executions(self, symbol, *, page=1, count=100):
+            return {"data": {"list": [{
+                "orderId": "GMO-ORPHAN", "symbol": "BTC", "side": "SELL",
+                "size": "0.1", "price": "101", "fee": "0.001",
+                "timestamp": submitted_at,
+            }] if page == 1 else []}}
+
+        async def active_orders(self, symbol, *, page=1, count=100):
+            return {"data": {"list": []}}
+
+        async def order(self, order_id):
+            return {"data": {"list": [{
+                "orderId": order_id, "symbol": "BTC", "side": "SELL", "size": "0.1",
+                "executionType": "MARKET", "timeInForce": "FAK", "timestamp": submitted_at,
+            }]}}
+
+    adapter = RecoveryGmo()
+    limiter = PriorityRateLimiter()
+    executor = GmoHedgeExecutor(
+        adapter, limiter, {"BTC_JPY": Decimal("0.1")}, orphan_recovery_grace_sec=0,
+    )
+    risk = RiskGate(store, confirmation_phrase="ARM", kill_sentinel=tmp_path / "KILL")
+    worker = HedgeWorker(
+        store, EventBus(), executor, risk, min_sizes={"BTC_JPY": Decimal("0.1")},
+        resolver=executor.resolve,
+    )
+    await worker.start()
+    recovered = await store.hedge_intent(intent.id)
+    assert recovered.status == HedgeStatus.HEDGED
+    assert recovered.filled_qty == Decimal("0.1")
+    assert recovered.exchange_order_id == "GMO-ORPHAN"
+    assert (await store.submissions_for_intent(intent.id))[0].status == "RESOLVED"
+    assert adapter.market_orders == 0
+    await worker.stop()
+    await limiter.stop()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_process_exit_after_fak_acceptance_leaves_durable_recovery_barrier(tmp_path):
+    db_path = tmp_path / "crash.db"
+    script = textwrap.dedent(f"""
+        import asyncio
+        import os
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from backend.engine.domain import HedgeStatus, OrderState
+        from backend.engine.hedge_worker import GmoHedgeExecutor
+        from backend.engine.rate_limit import PriorityRateLimiter
+        from backend.engine.state_store import StateStore
+
+        async def main():
+            store = StateStore({str(db_path)!r})
+            await store.initialize()
+            await store.create_order('BT-CRASH', 'BTC_JPY', 'BUY', Decimal('0.1'), Decimal('100'))
+            await store.transition_order('BT-CRASH', OrderState.PLACING)
+            await store.transition_order('BT-CRASH', OrderState.OPEN, exchange_order_id='BT-1')
+            fill = await store.record_cumulative_fill(
+                client_order_id='BT-CRASH', order_id='BT-1', trade_id='T-1',
+                symbol='BTC_JPY', side='BUY', cumulative_qty=Decimal('0.1'),
+                price=Decimal('100'), fee=Decimal('0'),
+                occurred_at=datetime.now(timezone.utc).isoformat(),
+            )
+            intent = next(item for item in await store.pending_hedges() if item.client_fill_id == fill.fill_id)
+            await store.transition_hedge(intent.id, HedgeStatus.HEDGING)
+
+            class AcceptedGmo:
+                async def market_order(self, *args):
+                    return {{'status': 0, 'data': {{'orderId': 'GMO-CRASH'}}}}
+
+            limiter = PriorityRateLimiter()
+            executor = GmoHedgeExecutor(AcceptedGmo(), limiter, {{'BTC_JPY': Decimal('0.1')}})
+
+            async def prepare(kind, qty, submitted_at):
+                row = await store.prepare_hedge_submission(
+                    [intent.id], symbol='BTC_JPY', side='SELL', qty=qty,
+                    execution_type=kind, submitted_at=submitted_at,
+                )
+                return row.id
+
+            async def acknowledge(_submission_id, _order_id):
+                os._exit(17)
+
+            async def complete(*_args):
+                raise AssertionError('process should exit before completion')
+
+            async def reject(*_args):
+                raise AssertionError('accepted order must not be rejected')
+
+            executor.set_submission_hooks(prepare, acknowledge, complete, reject)
+            await executor('BTC_JPY', 'SELL', Decimal('0.1'))
+
+        asyncio.run(main())
+    """)
+    crashed = subprocess.run(
+        [sys.executable, "-c", script], cwd=str(Path(__file__).parents[1]),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert crashed.returncode == 17, crashed.stderr
+
+    store = StateStore(db_path)
+    await store.initialize()
+    submissions = await store.pending_hedge_submissions()
+    assert len(submissions) == 1 and submissions[0].status == "SUBMITTING"
+    submitted_at = submissions[0].submitted_at
+
+    class RecoveryGmo:
+        market_orders = 0
+
+        async def market_order(self, *args):
+            self.market_orders += 1
+            raise AssertionError("restart must reconcile before any retry")
+
+        async def latest_executions(self, symbol, *, page=1, count=100):
+            return {"data": {"list": [{
+                "orderId": "GMO-CRASH", "symbol": "BTC", "side": "SELL",
+                "size": "0.1", "price": "101", "fee": "0",
+                "timestamp": submitted_at,
+            }] if page == 1 else []}}
+
+        async def active_orders(self, symbol, *, page=1, count=100):
+            return {"data": {"list": []}}
+
+        async def order(self, order_id):
+            return {"data": {"list": [{
+                "orderId": order_id, "symbol": "BTC", "side": "SELL", "size": "0.1",
+                "executionType": "MARKET", "timeInForce": "FAK", "timestamp": submitted_at,
+            }]}}
+
+    adapter = RecoveryGmo()
+    limiter = PriorityRateLimiter()
+    executor = GmoHedgeExecutor(
+        adapter, limiter, {"BTC_JPY": Decimal("0.1")}, orphan_recovery_grace_sec=0,
+    )
+    risk = RiskGate(store, confirmation_phrase="ARM", kill_sentinel=tmp_path / "KILL")
+    worker = HedgeWorker(
+        store, EventBus(), executor, risk, min_sizes={"BTC_JPY": Decimal("0.1")},
+        resolver=executor.resolve,
+    )
+    await worker.start()
+    assert adapter.market_orders == 0
+    assert not await store.pending_hedge_submissions()
+    assert not await store.pending_hedges()
+    await worker.stop()
+    await limiter.stop()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_response_lost_sok_fallback_fak_recovers_only_the_remainder(tmp_path):
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    await store.create_order("BTCJPY-BUY-HYBRID", "BTC_JPY", "BUY", Decimal("0.1"), Decimal("100"))
+    await store.transition_order("BTCJPY-BUY-HYBRID", OrderState.PLACING)
+    await store.transition_order("BTCJPY-BUY-HYBRID", OrderState.OPEN, exchange_order_id="BT-HYBRID")
+    fill = await store.record_cumulative_fill(
+        client_order_id="BTCJPY-BUY-HYBRID", order_id="BT-HYBRID", trade_id="T-HYBRID",
+        symbol="BTC_JPY", side="BUY", cumulative_qty=Decimal("0.1"),
+        price=Decimal("100"), fee=Decimal("0"), occurred_at=datetime.now(timezone.utc).isoformat(),
+    )
+    intent = next(item for item in await store.pending_hedges() if item.client_fill_id == fill.fill_id)
+    intent = await store.transition_hedge(
+        intent.id, HedgeStatus.HEDGING, filled_qty=Decimal("0.06"),
+        filled_notional=Decimal("6.06"), exchange_order_id="GMO-SOK",
+    )
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    await store.prepare_hedge_submission(
+        [intent.id], symbol="BTC_JPY", side="SELL", qty=Decimal("0.04"),
+        execution_type="FAK", submitted_at=submitted_at,
+    )
+
+    class RecoveryGmo:
+        async def latest_executions(self, symbol, *, page=1, count=100):
+            return {"data": {"list": [{
+                "orderId": "GMO-FAK", "symbol": "BTC", "side": "SELL",
+                "size": "0.04", "price": "102", "fee": "0.002",
+                "timestamp": submitted_at,
+            }] if page == 1 else []}}
+
+        async def active_orders(self, symbol, *, page=1, count=100):
+            return {"data": {"list": []}}
+
+        async def order(self, order_id):
+            return {"data": {"list": [{
+                "orderId": order_id, "symbol": "BTC", "side": "SELL", "size": "0.04",
+                "executionType": "MARKET", "timeInForce": "FAK", "timestamp": submitted_at,
+            }]}}
+
+    limiter = PriorityRateLimiter()
+    executor = GmoHedgeExecutor(
+        RecoveryGmo(), limiter, {"BTC_JPY": Decimal("0.01")},
+        orphan_recovery_grace_sec=0,
+    )
+    risk = RiskGate(store, confirmation_phrase="ARM", kill_sentinel=tmp_path / "KILL")
+    worker = HedgeWorker(
+        store, EventBus(), executor, risk, min_sizes={"BTC_JPY": Decimal("0.01")},
+        resolver=executor.resolve,
+    )
+    await worker.start()
+    recovered = await store.hedge_intent(intent.id)
+    assert recovered.status == HedgeStatus.HEDGED
+    assert recovered.filled_qty == Decimal("0.10")
+    assert recovered.filled_notional == Decimal("10.14")
+    await worker.stop()
+    await limiter.stop()
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_checkpointed_fak_timeout_is_resolved_without_submitting_another_order(tmp_path):
     store = StateStore(tmp_path / "state.db")
     await store.initialize()
@@ -813,10 +1070,10 @@ async def test_gmo_public_ws_serializes_subscriptions_and_publishes_best_level(m
     with pytest.raises(asyncio.CancelledError):
         await task
     assert [(row["symbol"], row["channel"]) for row in sent[:4]] == [
-        ("BTC", "orderbooks"), ("ETH", "orderbooks"),
-        ("BTC", "trades"), ("ETH", "trades"),
+        ("BTC", "orderbooks"), ("BTC", "trades"),
+        ("ETH", "orderbooks"), ("ETH", "trades"),
     ]
-    assert sent[2]["option"] == "TAKER_ONLY"
+    assert sent[1]["option"] == "TAKER_ONLY"
     assert delays[:4] == [1.1, 1.1, 1.1, 1.1]
     assert event.payload.bid == 100
     assert event.payload.askSize == 3

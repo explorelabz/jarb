@@ -75,6 +75,7 @@ class PaperBroker:
         self.recent: list[dict[str, Any]] = []
         self.fill_queue: asyncio.Queue[CumulativeFillEvent] = asyncio.Queue()
         self.gmo_orders: dict[str, dict[str, Any]] = {}
+        self.gmo_active_sok: dict[tuple[str, str], dict[str, None]] = {}
         self._order_seq = 0
         self._trade_seq = 0
         self._gmo_seq = 0
@@ -115,6 +116,8 @@ class PaperBroker:
             }
             for key, value in payload.get("gmoOrders", {}).items()
         }
+        self._rebuild_gmo_active_index()
+        self._prune_gmo_orders()
         self.balances = {
             venue: {asset: Decimal(amount) for asset, amount in assets.items()}
             for venue, assets in payload.get("balances", {}).items()
@@ -173,6 +176,36 @@ class PaperBroker:
             "gmoSokFillQty": str(self.gmo_sok_fill_qty),
             "gmoSokFillsWithoutPublicTrade": self.gmo_sok_fills_without_public_trade,
         })
+
+    def _rebuild_gmo_active_index(self) -> None:
+        self.gmo_active_sok.clear()
+        for order_id, row in self.gmo_orders.items():
+            if row.get("timeInForce") == "SOK" and not row.get("canceled") and not row.get("terminal"):
+                taker_side = "SELL" if row["side"] == "BUY" else "BUY"
+                self.gmo_active_sok.setdefault((row["symbol"], taker_side), {})[order_id] = None
+
+    def _index_gmo_sok(self, order_id: str, row: dict[str, Any]) -> None:
+        taker_side = "SELL" if row["side"] == "BUY" else "BUY"
+        self.gmo_active_sok.setdefault((row["symbol"], taker_side), {})[order_id] = None
+
+    def _deindex_gmo_sok(self, order_id: str, row: dict[str, Any]) -> None:
+        taker_side = "SELL" if row["side"] == "BUY" else "BUY"
+        bucket = self.gmo_active_sok.get((row["symbol"], taker_side))
+        if bucket is not None:
+            bucket.pop(order_id, None)
+            if not bucket:
+                self.gmo_active_sok.pop((row["symbol"], taker_side), None)
+
+    def _prune_gmo_orders(self, limit: int = 2_000) -> None:
+        excess = len(self.gmo_orders) - limit
+        if excess <= 0:
+            return
+        removable = [
+            order_id for order_id, row in self.gmo_orders.items()
+            if row.get("canceled") or row.get("terminal") or row.get("timeInForce") == "FAK"
+        ]
+        for order_id in removable[:excess]:
+            self.gmo_orders.pop(order_id, None)
 
     def configure(self, patch: dict[str, Any]) -> PaperScenarioConfig:
         values = self.scenarios.model_dump()
@@ -547,7 +580,9 @@ class FakeGmo:
             "partial": filled < requested, "timeInForce": "FAK", "executionType": "MARKET",
             "canceled": False,
             "evaluated": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        self.broker._prune_gmo_orders()
         self.broker.apply_gmo_balance(symbol.removesuffix("_JPY"), side, filled, filled * price)
         await self.broker.persist()
         return {"status": 0, "data": {"orderId": order_id}}
@@ -572,7 +607,10 @@ class FakeGmo:
             "canceled": False, "terminal": False, "size_step": size_step,
             "ahead_better": queue.ahead_better, "ahead_same": queue.ahead_same,
             "last_market_version": self.broker._market_versions.get(symbol, 0),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        self.broker._index_gmo_sok(order_id, self.broker.gmo_orders[order_id])
+        self.broker._prune_gmo_orders()
         await self.broker.persist()
         return {"status": 0, "data": {"orderId": order_id}}
 
@@ -607,6 +645,8 @@ class FakeGmo:
         row["filled"] = previous_filled + execution_qty
         row["partial"] = row["filled"] < requested
         row["terminal"] = row["filled"] >= requested
+        if row["terminal"]:
+            self.broker._deindex_gmo_sok(str(row["orderId"]), row)
         self.broker.gmo_sok_fill_events += 1
         self.broker.gmo_sok_fill_qty += execution_qty
         if not caused_by_public_trade:
@@ -624,7 +664,11 @@ class FakeGmo:
         self.broker.gmo_public_trades_seen += 1
         available = trade.qty
         changed = False
-        for row in self.broker.gmo_orders.values():
+        order_ids = tuple(self.broker.gmo_active_sok.get((trade.symbol, trade.taker_side), {}))
+        for order_id in order_ids:
+            row = self.broker.gmo_orders.get(order_id)
+            if row is None:
+                continue
             if available <= 0:
                 break
             if row.get("timeInForce") != "SOK" or row.get("canceled") or row.get("terminal"):
@@ -677,6 +721,8 @@ class FakeGmo:
     async def cancel_order(self, order_id: str) -> dict:
         row = self.broker.gmo_orders[str(order_id)]
         row["canceled"] = True
+        self.broker._deindex_gmo_sok(str(order_id), row)
+        self.broker._prune_gmo_orders()
         await self.broker.persist()
         return {"status": 0, "data": str(order_id)}
 
@@ -689,7 +735,40 @@ class FakeGmo:
             await self.broker.persist()
         return {"status": 0, "data": [{
             "orderId": order_id, "size": str(row["filled"]), "price": str(row["price"]),
+            "symbol": row["symbol"].removesuffix("_JPY"), "side": row["side"],
+            "fee": "0", "timestamp": row.get("timestamp", utc_now()),
         }] if row["filled"] > 0 else []}
+
+    async def latest_executions(self, symbol: str, *, page: int = 1, count: int = 100) -> dict:
+        normalized = symbol if symbol.endswith("_JPY") else f"{symbol}_JPY"
+        rows = [
+            {
+                "orderId": order_id, "symbol": row["symbol"].removesuffix("_JPY"),
+                "side": row["side"], "size": str(row["filled"]), "price": str(row["price"]),
+                "fee": "0", "timestamp": row.get("timestamp", utc_now()),
+            }
+            for order_id, row in reversed(self.broker.gmo_orders.items())
+            if row["symbol"] == normalized and row["filled"] > 0
+        ]
+        start = (page - 1) * count
+        return {"status": 0, "data": {"list": rows[start:start + count]}}
+
+    async def active_orders(self, symbol: str, *, page: int = 1, count: int = 100) -> dict:
+        normalized = symbol if symbol.endswith("_JPY") else f"{symbol}_JPY"
+        rows = [
+            {
+                "orderId": order_id, "symbol": row["symbol"].removesuffix("_JPY"),
+                "side": row["side"], "size": str(row["requested"]),
+                "executionType": row.get("executionType", "MARKET"),
+                "timeInForce": row.get("timeInForce", "FAK"),
+                "timestamp": row.get("timestamp", utc_now()),
+            }
+            for order_id, row in reversed(self.broker.gmo_orders.items())
+            if row["symbol"] == normalized and not row.get("canceled") and not row.get("terminal")
+            and row.get("timeInForce") == "SOK"
+        ]
+        start = (page - 1) * count
+        return {"status": 0, "data": {"list": rows[start:start + count]}}
 
     async def order(self, order_id: str) -> dict:
         row = self.broker.gmo_orders[str(order_id)]
@@ -709,6 +788,8 @@ class FakeGmo:
             "orderId": order_id, "status": status, "executedSize": str(row["filled"]),
             "timeInForce": row.get("timeInForce", "FAK"),
             "executionType": row.get("executionType", "MARKET"), "price": str(row["price"]),
+            "symbol": row["symbol"].removesuffix("_JPY"), "side": row["side"],
+            "size": str(row["requested"]), "timestamp": row.get("timestamp", utc_now()),
         }]}}
 
     async def balances(self) -> dict:

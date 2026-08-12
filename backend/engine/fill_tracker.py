@@ -180,8 +180,11 @@ class BitTradePrivateWS:
         if not client_id and self.store is not None:
             raw_price = order.get("price", data.get("tradePrice"))
             price = Decimal(str(raw_price)) if raw_price is not None else None
+            occurred_at = datetime.fromtimestamp(
+                int(data["tradeTime"]) / 1000, timezone.utc,
+            ).isoformat()
             client_id = str(await self.store.resolve_client_order_for_exchange_fill(
-                order_id, symbol=symbol, side=side, price=price,
+                order_id, symbol=symbol, side=side, price=price, occurred_at=occurred_at,
             ) or "")
         if not client_id:
             if self.store is not None:
@@ -282,6 +285,10 @@ class BitTradeRestFillSource:
                     resolved = await self.store.resolve_client_order_for_exchange_fill(
                         str(exchange_id), symbol=symbol, side=side,
                         price=Decimal(str(raw_price)) if raw_price is not None else None,
+                        occurred_at=datetime.fromtimestamp(
+                            int(row.get("created-at", row.get("createdAt", now_ms))) / 1000,
+                            timezone.utc,
+                        ).isoformat(),
                     )
                     if resolved is not None:
                         order = await self.store.order(resolved)

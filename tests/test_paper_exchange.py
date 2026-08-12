@@ -211,6 +211,27 @@ async def test_canceled_sok_remains_queryable_when_market_is_stale():
 
 
 @pytest.mark.asyncio
+async def test_fake_gmo_bounds_terminal_history_and_indexes_only_active_sok_orders():
+    broker = PaperBroker()
+    broker.set_market(market(bid="99", ask="101"))
+    gmo = FakeGmo(broker)
+    for _ in range(2_050):
+        await gmo.market_order("BTC_JPY", "BUY", Decimal(".1"), Decimal(".1"))
+    assert len(broker.gmo_orders) == 2_000
+
+    active_ids = []
+    for _ in range(25):
+        response = await gmo.post_only_order(
+            "BTC_JPY", "BUY", Decimal(".1"), Decimal("99"),
+            Decimal(".1"), Decimal("1"),
+        )
+        active_ids.append(str(response["data"]["orderId"]))
+    for order_id in active_ids[:-1]:
+        await gmo.cancel_order(order_id)
+    assert tuple(broker.gmo_active_sok[("BTC_JPY", "SELL")]) == (active_ids[-1],)
+
+
+@pytest.mark.asyncio
 async def test_stale_gmo_market_is_classified_as_retryable_hedge_failure(tmp_path):
     store = StateStore(tmp_path / "state.db", trading_mode="paper")
     await store.initialize()

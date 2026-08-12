@@ -104,6 +104,16 @@ class GmoAdapter:
     async def order(self, order_id: str) -> dict:
         return await self._private("GET", "/v1/orders", query={"orderId": order_id})
 
+    async def latest_executions(self, symbol: str, *, page: int = 1, count: int = 100) -> dict:
+        return await self._private("GET", "/v1/latestExecutions", query={
+            "symbol": symbol.replace("_JPY", ""), "page": str(page), "count": str(count),
+        })
+
+    async def active_orders(self, symbol: str, *, page: int = 1, count: int = 100) -> dict:
+        return await self._private("GET", "/v1/activeOrders", query={
+            "symbol": symbol.replace("_JPY", ""), "page": str(page), "count": str(count),
+        })
+
     async def balances(self) -> dict:
         return await self._private("GET", "/v1/account/assets")
 
