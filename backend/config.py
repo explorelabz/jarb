@@ -56,7 +56,7 @@ strategy_config = StrategyConfig(
 )
 
 requested_mode = "live" if os.getenv("TRADING_MODE", "paper").strip().lower() in {"online", "live"} else "paper"
-require_dual_arm_approval = boolean("REQUIRE_DUAL_ARM_APPROVAL", True)
+require_dual_arm_approval = boolean("REQUIRE_DUAL_ARM_APPROVAL", False)
 risk_limits = RiskLimits(
     max_single_order_jpy=number("MAX_SINGLE_ORDER_JPY", 250_000),
     max_daily_volume_jpy=number("MAX_DAILY_VOLUME_JPY", 5_000_000),

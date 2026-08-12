@@ -20,6 +20,7 @@ BOB_AUTH = {"Authorization": f"Bearer {BOB_TOKEN}"}
 @pytest.mark.asyncio
 async def test_health_and_paper_mode_exposes_live_market_source(monkeypatch):
     monkeypatch.setenv("JARB_OPERATOR_TOKENS", f"alice={ALICE_TOKEN},bob={BOB_TOKEN}")
+    monkeypatch.setattr(main, "require_dual_arm_approval", True)
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -106,6 +107,19 @@ async def test_health_and_paper_mode_exposes_live_market_source(monkeypatch):
             })
             assert cleared.json()["gmoConfigured"] is True
             assert cleared.json()["bittradeConfigured"] is True
+            monkeypatch.setattr(main, "require_dual_arm_approval", False)
+            updated = await client.patch(
+                "/api/risk/limits", headers=AUTH,
+                json={"maxSingleOrderJpy": 230000},
+            )
+            assert updated.status_code == 200
+            assert updated.json()["maxSingleOrderJpy"] == 230000
+            assert "approvalId" not in updated.json()
+            disabled = await client.post(
+                "/api/approvals/not-required/approve", headers=AUTH,
+            )
+            assert disabled.status_code == 409
+            assert "单操作员模式" in disabled.text
 
 
 @pytest.mark.asyncio
