@@ -98,6 +98,9 @@ function Metric({ label, value, note, tone = '' }: { label: string; value: strin
 function MarketLadder({ state }: { state: SystemState }) {
   const bid = state.quotes.find(q => q.side === 'BUY')
   const ask = state.quotes.find(q => q.side === 'SELL')
+  const tick = state.instrument.priceTick
+  const indicativeBid = Math.floor(state.market.bid * (1 - state.config.spreadBps / 10_000) / tick) * tick
+  const indicativeAsk = Math.ceil(state.market.ask * (1 + state.config.spreadBps / 10_000) / tick) * tick
   const mid = (state.market.ask + state.market.bid) / 2
   return <section className="market-panel panel" aria-labelledby="market-title">
     <div className="section-head">
@@ -106,8 +109,8 @@ function MarketLadder({ state }: { state: SystemState }) {
     </div>
     <div className="ladder">
       <div className="ladder-row client ask">
-        <div><span>BitTrade Ask</span><small>客户买入价 · 可挂 {decimal.format(ask?.size ?? 0)} {state.instrument.baseAsset}</small></div>
-        <strong>¥{price(ask?.price ?? 0, state.instrument.priceTick)}</strong>
+        <div><span>BitTrade Ask</span><small>{ask ? `客户买入价 · 可挂 ${decimal.format(ask.size)} ${state.instrument.baseAsset}` : '参考价 · 当前未挂单'}</small></div>
+        <strong>¥{price(ask?.price ?? indicativeAsk, tick)}</strong>
       </div>
       <div className="spread-band"><span>卖出加价</span><b>+{state.config.spreadBps.toFixed(1)} bps</b></div>
       <div className="ladder-row external">
@@ -119,8 +122,8 @@ function MarketLadder({ state }: { state: SystemState }) {
       </div>
       <div className="spread-band"><span>买入减价</span><b>−{state.config.spreadBps.toFixed(1)} bps</b></div>
       <div className="ladder-row client bid">
-        <div><span>BitTrade Bid</span><small>客户卖出价 · 可挂 {decimal.format(bid?.size ?? 0)} {state.instrument.baseAsset}</small></div>
-        <strong>¥{price(bid?.price ?? 0, state.instrument.priceTick)}</strong>
+        <div><span>BitTrade Bid</span><small>{bid ? `客户卖出价 · 可挂 ${decimal.format(bid.size)} ${state.instrument.baseAsset}` : '参考价 · 当前未挂单'}</small></div>
+        <strong>¥{price(bid?.price ?? indicativeBid, tick)}</strong>
       </div>
     </div>
   </section>

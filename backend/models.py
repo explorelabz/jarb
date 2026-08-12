@@ -52,7 +52,7 @@ class StrategyConfig(BaseModel):
     maxQuoteSize: float = Field(0.05, gt=0)
     deltaLimit: float = Field(0.005, gt=0)
     maxHedgeLatencyMs: int = Field(2500, gt=0)
-    staleMarketMs: int = Field(800, gt=0)
+    staleMarketMs: int = Field(3000, gt=0)
     quoteRefreshMs: int = Field(1000, ge=100)
 
 

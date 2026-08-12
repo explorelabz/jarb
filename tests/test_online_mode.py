@@ -12,7 +12,11 @@ from backend.engine.state_store import StateStore
 from backend.models import (
     ClientFill, ConnectionUpdate, MarketTop, PaperScenarioUpdate, RiskLimitsUpdate, StrategyConfig, utc_now,
 )
-from backend.service import TradingService
+from backend.service import MARKET_WATCHDOG_INTERVAL_SEC, TradingService
+
+
+def test_default_stale_threshold_exceeds_rest_watchdog_cadence():
+    assert StrategyConfig().staleMarketMs > MARKET_WATCHDOG_INTERVAL_SEC * 1000
 
 
 class FakeGmo:
