@@ -461,11 +461,24 @@ class GmoHedgeExecutor:
         # record is sufficient to calculate notional exactly. Polling executions and
         # orders every 100ms for every concurrent hedge starves the QUERY token bucket
         # and increases (rather than decreases) real exposure time.
-        await asyncio.sleep(timeout_sec)
-        detail = await self._order_detail(order_id)
-        status = str(detail.get("status", "")).upper()
-        filled = min(expected, Decimal(str(detail.get("executedSize", "0") or "0")))
-        return filled, filled * price, status
+        paper_poll_interval = getattr(self.adapter, "passive_poll_interval_sec", None)
+        if paper_poll_interval is None:
+            await asyncio.sleep(timeout_sec)
+            detail = await self._order_detail(order_id)
+            status = str(detail.get("status", "")).upper()
+            filled = min(expected, Decimal(str(detail.get("executedSize", "0") or "0")))
+            return filled, filled * price, status
+        deadline = asyncio.get_running_loop().time() + timeout_sec
+        while True:
+            detail = await self._order_detail(order_id)
+            status = str(detail.get("status", "")).upper()
+            filled = min(expected, Decimal(str(detail.get("executedSize", "0") or "0")))
+            if status in ("EXECUTED", "CANCELED", "EXPIRED"):
+                return filled, filled * price, status
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return filled, filled * price, status
+            await asyncio.sleep(min(float(paper_poll_interval), remaining))
 
     async def _cancel_passive(self, order_id: str, expected: Decimal,
                               price: Decimal) -> tuple[Decimal, Decimal]:

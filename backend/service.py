@@ -1228,8 +1228,9 @@ class TradingService:
                         "info", "risk.paper.recovered",
                         f"Paper RiskGate 观测恢复：{previous}",
                     )
-            # Paper deliberately observes all live limits without letting them
-            # stop data collection or cancel simulated orders.
+            # Paper deliberately observes all live limits without stopping data
+            # collection. Stale quotes are independently canceled and suppressed
+            # by _run_live_quotes, which checks every symbol before placement.
             if self.risk_gate.killed:
                 self.state.killSwitch = True
             return

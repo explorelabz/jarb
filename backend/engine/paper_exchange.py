@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from ..adapters import DecimalQuote, ExchangeAPIError
 from ..models import MarketTop, utc_now
 from .fill_tracker import CumulativeFillEvent
+from .paper_queue import QueuePosition
 
 
 PAPER_SYMBOLS: dict[str, dict[str, str | int]] = {
@@ -65,6 +66,7 @@ class PaperBroker:
         self.rng = random.Random(self.scenarios.seed)
         self.markets: dict[str, MarketTop] = {}
         self._live_market_updated_at: dict[str, float] = {}
+        self._market_versions: dict[str, int] = {}
         self.orders: dict[str, dict[str, Any]] = {}
         self.client_to_order: dict[str, str] = {}
         self.matches_by_order: dict[str, list[dict[str, Any]]] = {}
@@ -99,6 +101,11 @@ class PaperBroker:
                 **value, "requested": Decimal(value["requested"]), "filled": Decimal(value["filled"]),
                 "price": Decimal(value["price"]),
                 "size_step": Decimal(value.get("size_step", "0.00000001")),
+                "ahead_better": Decimal(value.get("ahead_better", "0")),
+                "ahead_same": Decimal(value.get("ahead_same", "0")),
+                # The in-memory market version restarts with the process. Force
+                # restored passive orders to evaluate the first fresh snapshot.
+                "last_market_version": -1,
             }
             for key, value in payload.get("gmoOrders", {}).items()
         }
@@ -139,6 +146,8 @@ class PaperBroker:
                     **row, "requested": str(row["requested"]), "filled": str(row["filled"]),
                     "price": str(row["price"]),
                     "size_step": str(row.get("size_step", "0.00000001")),
+                    "ahead_better": str(row.get("ahead_better", "0")),
+                    "ahead_same": str(row.get("ahead_same", "0")),
                 }
                 for key in retained_gmo_ids for row in (self.gmo_orders[key],)
             },
@@ -170,6 +179,7 @@ class PaperBroker:
         """Mirror an external market-data snapshot into the fake execution venues."""
         self.markets[market.symbol] = market
         self._live_market_updated_at[market.symbol] = time.monotonic()
+        self._market_versions[market.symbol] = self._market_versions.get(market.symbol, 0) + 1
 
     def execution_market(self, symbol: str, *, stale_after_sec: float = 3.0) -> MarketTop:
         updated_at = self._live_market_updated_at.get(symbol)
@@ -458,6 +468,8 @@ class FakeBitTrade:
 
 
 class FakeGmo:
+    passive_poll_interval_sec = .05
+
     def __init__(self, broker: PaperBroker):
         self.broker = broker
         self.api_key = "paper-key"
@@ -525,50 +537,85 @@ class FakeGmo:
     async def post_only_order(self, symbol: str, side: str, size: Decimal, price: Decimal,
                               size_step: Decimal, price_tick: Decimal) -> dict:
         self.broker.maybe_fault()
-        self.broker.execution_market(symbol)
+        market = self.broker.execution_market(symbol)
         self.broker._gmo_seq += 1
         order_id = f"PAPER-GMO-{self.broker._gmo_seq}"
         requested = Decimal(str(size))
         limit_price = Decimal(str(price))
+        same_side_levels = market.bids if side == "BUY" else market.asks
+        queue = QueuePosition.from_levels([
+            (Decimal(str(level[0])), Decimal(str(level[1]))) for level in same_side_levels
+            if len(level) >= 2 and Decimal(str(level[1])) > 0
+        ], side, limit_price)
         self.broker.gmo_orders[order_id] = {
             "orderId": order_id, "symbol": symbol, "side": side, "requested": requested,
             "filled": Decimal("0"), "price": limit_price,
             "available_at": time.time() + self.broker.scenarios.gmoPostOnlyFillDelayMs / 1000,
             "partial": True, "timeInForce": "SOK", "executionType": "LIMIT",
-            "canceled": False, "evaluated": False, "size_step": size_step,
+            "canceled": False, "terminal": False, "size_step": size_step,
+            "ahead_better": queue.ahead_better, "ahead_same": queue.ahead_same,
+            "last_market_version": self.broker._market_versions.get(symbol, 0),
         }
         await self.broker.persist()
         return {"status": 0, "data": {"orderId": order_id}}
 
     def _evaluate_post_only(self, row: dict[str, Any]) -> bool:
-        if row.get("evaluated") or time.time() < row["available_at"]:
+        if row.get("canceled") or row.get("terminal") or time.time() < row["available_at"]:
             return False
         market = self.broker.execution_market(row["symbol"])
+        market_version = self.broker._market_versions.get(row["symbol"], 0)
+        if market_version <= int(row.get("last_market_version", -1)):
+            return False
+        row["last_market_version"] = market_version
         limit_price = Decimal(str(row["price"]))
+        same_side_raw = market.bids if row["side"] == "BUY" else market.asks
+        same_side_levels = [
+            (Decimal(str(level[0])), Decimal(str(level[1]))) for level in same_side_raw
+            if len(level) >= 2 and Decimal(str(level[1])) > 0
+        ]
+        queue = QueuePosition(
+            Decimal(str(row.get("ahead_better", "0"))),
+            Decimal(str(row.get("ahead_same", "0"))),
+        )
+        queue.resync(same_side_levels, row["side"], limit_price)
         raw_levels = market.asks if row["side"] == "BUY" else market.bids
-        levels = [
+        opposite_levels = [
             (Decimal(str(level[0])), Decimal(str(level[1]))) for level in raw_levels
             if len(level) >= 2 and Decimal(str(level[1])) > 0
         ]
-        if not levels:
+        if not opposite_levels:
             fallback_price = market.ask if row["side"] == "BUY" else market.bid
             fallback_size = market.askSize if row["side"] == "BUY" else market.bidSize
-            levels = [(Decimal(str(fallback_price)), Decimal(str(fallback_size)))]
+            opposite_levels = [(Decimal(str(fallback_price)), Decimal(str(fallback_size)))]
         if row["side"] == "BUY":
-            touched = [(price, qty) for price, qty in levels if price <= limit_price]
+            touched = [(price, qty) for price, qty in opposite_levels if price <= limit_price]
+            through = any(price < limit_price for price, _ in touched)
         else:
-            touched = [(price, qty) for price, qty in levels if price >= limit_price]
+            touched = [(price, qty) for price, qty in opposite_levels if price >= limit_price]
+            through = any(price > limit_price for price, _ in touched)
+        row["ahead_better"] = queue.ahead_better
+        row["ahead_same"] = queue.ahead_same
+        if not touched:
+            return True
+        available = sum((qty for _, qty in touched), Decimal("0"))
+        if through:
+            queue.clear()
+        consumed = queue.consume(available)
+        available -= consumed
+        row["ahead_better"] = queue.ahead_better
+        row["ahead_same"] = queue.ahead_same
         requested = Decimal(str(row["requested"]))
         step = Decimal(str(row.get("size_step", "0.00000001")))
-        filled = min(requested, sum((qty for _, qty in touched), Decimal("0")))
-        filled = (filled / step).to_integral_value(rounding=ROUND_DOWN) * step
-        notional = filled * limit_price
-        row["filled"] = filled
-        row["partial"] = filled < requested
-        row["evaluated"] = True
-        if filled > 0:
+        previous_filled = Decimal(str(row.get("filled", "0")))
+        execution_qty = min(requested - previous_filled, available)
+        execution_qty = (execution_qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+        if execution_qty > 0:
+            row["filled"] = previous_filled + execution_qty
+            row["partial"] = row["filled"] < requested
+            row["terminal"] = True
             self.broker.apply_gmo_balance(
-                row["symbol"].removesuffix("_JPY"), row["side"], filled, notional,
+                row["symbol"].removesuffix("_JPY"), row["side"], execution_qty,
+                execution_qty * limit_price,
             )
         return True
 
@@ -583,7 +630,7 @@ class FakeGmo:
         row = self.broker.gmo_orders[str(order_id)]
         if time.time() < row["available_at"]:
             return {"status": 0, "data": []}
-        if self._evaluate_post_only(row):
+        if not row.get("canceled") and self._evaluate_post_only(row):
             await self.broker.persist()
         return {"status": 0, "data": [{
             "orderId": order_id, "size": str(row["filled"]), "price": str(row["price"]),
@@ -591,13 +638,15 @@ class FakeGmo:
 
     async def order(self, order_id: str) -> dict:
         row = self.broker.gmo_orders[str(order_id)]
-        if self._evaluate_post_only(row):
+        if not row.get("canceled") and self._evaluate_post_only(row):
             await self.broker.persist()
         if row.get("canceled"):
             status = "CANCELED"
+        elif row.get("terminal"):
+            status = "EXECUTED"
         elif time.time() < row["available_at"]:
             status = "ORDERED"
-        elif row.get("timeInForce") == "SOK" and row["partial"]:
+        elif row.get("timeInForce") == "SOK":
             status = "ORDERED"
         else:
             status = "CANCELED" if row["partial"] else "EXECUTED"

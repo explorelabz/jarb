@@ -14,6 +14,7 @@ from typing import Any, Protocol
 import websockets
 
 from .fill_tracker import CumulativeFillEvent, FillTracker
+from .paper_queue import QueuePosition
 
 
 def _symbol_pair(symbol: str) -> str:
@@ -248,8 +249,7 @@ class PaperOrder:
     side: str
     price: Decimal
     qty: Decimal
-    ahead_better: Decimal
-    ahead_same: Decimal
+    queue: QueuePosition
     filled: Decimal = Decimal("0")
     seq: int = 0
     active: bool = False
@@ -257,20 +257,22 @@ class PaperOrder:
 
     @property
     def ahead_qty(self) -> Decimal:
-        return self.ahead_better + self.ahead_same
+        return self.queue.ahead_qty
+
+    @property
+    def ahead_better(self) -> Decimal:
+        return self.queue.ahead_better
+
+    @property
+    def ahead_same(self) -> Decimal:
+        return self.queue.ahead_same
 
     def clear_ahead(self) -> None:
-        self.ahead_better = Decimal("0")
-        self.ahead_same = Decimal("0")
+        self.queue.clear()
 
     def consume_ahead(self, available: Decimal) -> Decimal:
         """Consume visible queue with same-price FIFO volume first."""
-        consumed_same = min(self.ahead_same, available)
-        self.ahead_same -= consumed_same
-        available -= consumed_same
-        consumed_better = min(self.ahead_better, available)
-        self.ahead_better -= consumed_better
-        return consumed_same + consumed_better
+        return self.queue.consume(available)
 
 
 class PaperMatchingEngine:
@@ -307,14 +309,11 @@ class PaperMatchingEngine:
     async def on_place(self, client_order_id: str, symbol: str, side: str,
                        price: Decimal, qty: Decimal) -> PaperOrder:
         levels = self.depth_provider.levels(symbol, side)
-        ahead_better = sum((size for level_price, size in levels if (
-            level_price < price if side == "SELL" else level_price > price
-        )), Decimal("0"))
-        ahead_same = sum((size for level_price, size in levels if level_price == price), Decimal("0"))
+        queue = QueuePosition.from_levels(levels, side, price)
         async with self._lock:
             self._placed_seq += 1
             order = PaperOrder(
-                client_order_id, symbol, side, price, qty, ahead_better, ahead_same,
+                client_order_id, symbol, side, price, qty, queue,
                 placed_seq=self._placed_seq,
             )
             self.orders[client_order_id] = order
@@ -434,14 +433,7 @@ class PaperMatchingEngine:
                 if not order.active:
                     continue
                 levels = self.depth_provider.levels(order.symbol, order.side)
-                snapshot_better = sum((size for price, size in levels if (
-                    price < order.price if order.side == "SELL" else price > order.price
-                )), Decimal("0"))
-                snapshot_same = sum((
-                    size for price, size in levels if price == order.price
-                ), Decimal("0"))
-                order.ahead_better = min(order.ahead_better, snapshot_better)
-                order.ahead_same = min(order.ahead_same, snapshot_same)
+                order.queue.resync(levels, order.side, order.price)
 
     async def resync_queue(self, interval_sec: float = 2.0) -> None:
         while True:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import time
 from decimal import Decimal
 
@@ -239,6 +240,18 @@ async def test_paper_gateway_observes_risk_limit_without_blocking_order(tmp_path
     assert risk.armed
     assert gateway.paper_risk_stats()["wouldReject"] == 1
     assert gateway.paper_risk_stats()["reasons"] == {"single order limit exceeded": 1}
+    for _ in range(2):
+        repeated = await gateway.place(
+            symbol="BTC_JPY", side="SELL", qty=Decimal("3000"), price=Decimal("100"),
+            size_step=Decimal(".1"), price_tick=Decimal("1"), snapshot=RiskSnapshot(),
+        )
+        assert repeated["state"] == "OPEN"
+    assert gateway.paper_risk_stats()["wouldReject"] == 3
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        audit_count = db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type='risk.paper.would_reject'",
+        ).fetchone()[0]
+    assert audit_count == 1
     await limiter.stop()
     await store.close()
 

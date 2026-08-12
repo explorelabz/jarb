@@ -63,6 +63,7 @@ class ExecutionGateway:
             **{**snapshot.__dict__, "order_notional_jpy": float(qty * price)},
         ), enforce=self.paper_engine is None)
         if self.paper_engine is not None:
+            previous_reason = self.paper_risk_last_reason
             self.paper_risk_evaluations += 1
             self.paper_risk_last_reason = reason
             if not allowed:
@@ -71,14 +72,15 @@ class ExecutionGateway:
                 self.paper_risk_reasons[normalized_reason] = (
                     self.paper_risk_reasons.get(normalized_reason, 0) + 1
                 )
-                await self.store.audit(
-                    "risk.paper.would_reject", "warning",
-                    f"Paper order would be rejected by RiskGate: {normalized_reason}",
-                    metadata={
-                        "symbol": symbol, "side": side, "qty": str(qty),
-                        "price": str(price), "orderNotionalJpy": str(qty * price),
-                    },
-                )
+                if normalized_reason != previous_reason:
+                    await self.store.audit(
+                        "risk.paper.would_reject", "warning",
+                        f"Paper order would be rejected by RiskGate: {normalized_reason}",
+                        metadata={
+                            "symbol": symbol, "side": side, "qty": str(qty),
+                            "price": str(price), "orderNotionalJpy": str(qty * price),
+                        },
+                    )
         elif not allowed:
             raise RuntimeError(f"order rejected by RiskGate: {reason}")
         sequence = await self.store.next_sequence(f"order-seq:{symbol}:{side}")
