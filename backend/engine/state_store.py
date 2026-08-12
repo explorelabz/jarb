@@ -4,13 +4,15 @@ import asyncio
 import json
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from .domain import (
-    HEDGE_TRANSITIONS, ORDER_TRANSITIONS, FillDelta, HedgeIntent, HedgeStatus, OrderState,
+    HEDGE_TRANSITIONS, ORDER_TRANSITIONS, FillDelta, HedgeIntent, HedgeStatus,
+    HedgeSubmission, OrderState,
 )
 
 
@@ -71,6 +73,34 @@ CREATE TABLE IF NOT EXISTS hedge_intents (
     FOREIGN KEY(client_fill_id) REFERENCES fills(id)
 );
 CREATE INDEX IF NOT EXISTS hedge_status_idx ON hedge_intents(status, symbol, side);
+
+CREATE TABLE IF NOT EXISTS hedge_submissions (
+    id TEXT PRIMARY KEY,
+    trading_mode TEXT NOT NULL DEFAULT 'live',
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+    qty TEXT NOT NULL,
+    execution_type TEXT NOT NULL CHECK(execution_type IN ('SOK','FAK')),
+    status TEXT NOT NULL CHECK(status IN ('SUBMITTING','ACKED','RESOLVED','ABSENT','ESCALATE')),
+    exchange_order_id TEXT,
+    filled_qty TEXT NOT NULL DEFAULT '0',
+    filled_notional TEXT NOT NULL DEFAULT '0',
+    fee_jpy TEXT NOT NULL DEFAULT '0',
+    submitted_at TEXT NOT NULL,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS hedge_submission_status_idx
+    ON hedge_submissions(trading_mode,status,symbol,side,submitted_at);
+
+CREATE TABLE IF NOT EXISTS hedge_submission_intents (
+    submission_id TEXT NOT NULL,
+    intent_id TEXT NOT NULL,
+    PRIMARY KEY(submission_id,intent_id),
+    FOREIGN KEY(submission_id) REFERENCES hedge_submissions(id),
+    FOREIGN KEY(intent_id) REFERENCES hedge_intents(id)
+);
 
 CREATE TABLE IF NOT EXISTS balances (
     venue TEXT NOT NULL,
@@ -412,6 +442,238 @@ class StateStore:
             ).fetchall()
             return [self._intent(row) for row in rows]
 
+    async def hedge_intent(self, intent_id: str) -> HedgeIntent | None:
+        return await asyncio.to_thread(self._hedge_intent_sync, intent_id)
+
+    def _hedge_intent_sync(self, intent_id: str) -> HedgeIntent | None:
+        with self._lock:
+            row = self._db().execute(
+                "SELECT * FROM hedge_intents WHERE id=?", (intent_id,),
+            ).fetchone()
+        return self._intent(row) if row is not None else None
+
+    async def prepare_hedge_submission(
+        self, intent_ids: list[str], *, symbol: str, side: str, qty: Decimal,
+        execution_type: str, submitted_at: str,
+    ) -> HedgeSubmission:
+        return await asyncio.to_thread(
+            self._prepare_hedge_submission_sync, intent_ids, symbol, side, qty,
+            execution_type, submitted_at,
+        )
+
+    def _prepare_hedge_submission_sync(
+        self, intent_ids: list[str], symbol: str, side: str, qty: Decimal,
+        execution_type: str, submitted_at: str,
+    ) -> HedgeSubmission:
+        unique_ids = list(dict.fromkeys(intent_ids))
+        if not unique_ids or qty <= 0 or execution_type not in ("SOK", "FAK"):
+            raise ValueError("invalid hedge submission")
+        submission_id = f"HS-{uuid4().hex}"
+        with self._lock:
+            db = self._db()
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                placeholders = ",".join("?" for _ in unique_ids)
+                rows = db.execute(
+                    f"SELECT id,status,symbol,side FROM hedge_intents WHERE id IN ({placeholders})",
+                    tuple(unique_ids),
+                ).fetchall()
+                if len(rows) != len(unique_ids) or any(
+                    row["status"] != HedgeStatus.HEDGING
+                    or row["symbol"] != symbol or row["side"] != side for row in rows
+                ):
+                    raise ValueError("hedge submission intents are not one active HEDGING group")
+                pending = db.execute(
+                    f"SELECT s.id FROM hedge_submissions s JOIN hedge_submission_intents si "
+                    f"ON si.submission_id=s.id WHERE si.intent_id IN ({placeholders}) "
+                    "AND s.status IN ('SUBMITTING','ACKED') LIMIT 1",
+                    tuple(unique_ids),
+                ).fetchone()
+                if pending is not None:
+                    raise ValueError(f"intent already has unresolved submission {pending['id']}")
+                db.execute(
+                    "INSERT INTO hedge_submissions(id,trading_mode,symbol,side,qty,execution_type,status,submitted_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        submission_id, self.trading_mode, symbol, side, str(qty),
+                        execution_type, "SUBMITTING", submitted_at,
+                    ),
+                )
+                db.executemany(
+                    "INSERT INTO hedge_submission_intents(submission_id,intent_id) VALUES(?,?)",
+                    [(submission_id, intent_id) for intent_id in unique_ids],
+                )
+                db.execute("COMMIT")
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
+        return self._hedge_submission_sync(submission_id)
+
+    async def acknowledge_hedge_submission(self, submission_id: str, order_id: str) -> HedgeSubmission:
+        return await asyncio.to_thread(
+            self._acknowledge_hedge_submission_sync, submission_id, order_id,
+        )
+
+    def _acknowledge_hedge_submission_sync(self, submission_id: str, order_id: str) -> HedgeSubmission:
+        with self._lock:
+            db = self._db()
+            row = db.execute(
+                "SELECT status,exchange_order_id FROM hedge_submissions WHERE id=?", (submission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(submission_id)
+            if row["status"] not in ("SUBMITTING", "ACKED"):
+                raise ValueError(f"cannot acknowledge submission in {row['status']}")
+            if row["exchange_order_id"] and str(row["exchange_order_id"]) != str(order_id):
+                raise ValueError("submission is already bound to another exchange order")
+            db.execute(
+                "UPDATE hedge_submissions SET status='ACKED',exchange_order_id=?,last_error=NULL,"
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (str(order_id), submission_id),
+            )
+        return self._hedge_submission_sync(submission_id)
+
+    async def finish_hedge_submission(
+        self, submission_id: str, *, filled_qty: Decimal, filled_notional: Decimal,
+        fee_jpy: Decimal, order_id: str | None = None,
+    ) -> HedgeSubmission:
+        return await asyncio.to_thread(
+            self._finish_hedge_submission_sync, submission_id, filled_qty,
+            filled_notional, fee_jpy, order_id,
+        )
+
+    def _finish_hedge_submission_sync(
+        self, submission_id: str, filled_qty: Decimal, filled_notional: Decimal,
+        fee_jpy: Decimal, order_id: str | None,
+    ) -> HedgeSubmission:
+        with self._lock:
+            db = self._db()
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                submission = db.execute(
+                    "SELECT * FROM hedge_submissions WHERE id=?", (submission_id,),
+                ).fetchone()
+                if submission is None:
+                    raise KeyError(submission_id)
+                if submission["status"] == "RESOLVED":
+                    db.execute("COMMIT")
+                    return self._hedge_submission_sync(submission_id)
+                if submission["status"] not in ("SUBMITTING", "ACKED"):
+                    raise ValueError(f"cannot finish submission in {submission['status']}")
+                if filled_qty < 0 or filled_qty > Decimal(submission["qty"]):
+                    raise ValueError("submission fill exceeds its durable requested quantity")
+                exchange_id = order_id or submission["exchange_order_id"]
+                if not exchange_id:
+                    raise ValueError("resolved exchange submission must have an order id")
+                intents = db.execute(
+                    "SELECT h.* FROM hedge_intents h JOIN hedge_submission_intents si "
+                    "ON si.intent_id=h.id WHERE si.submission_id=? ORDER BY h.created_at,h.id",
+                    (submission_id,),
+                ).fetchall()
+                available = max(Decimal("0"), filled_qty)
+                average = filled_notional / filled_qty if filled_qty > 0 else Decimal("0")
+                for intent in intents:
+                    required = max(Decimal("0"), Decimal(intent["qty"]) - Decimal(intent["filled_qty"]))
+                    allocated = min(required, available)
+                    available -= allocated
+                    allocated_fee = fee_jpy * allocated / filled_qty if filled_qty > 0 else Decimal("0")
+                    db.execute(
+                        "UPDATE hedge_intents SET filled_qty=?,filled_notional=?,fee_jpy=?,"
+                        "exchange_order_id=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (
+                            str(Decimal(intent["filled_qty"]) + allocated),
+                            str(Decimal(intent["filled_notional"]) + allocated * average),
+                            str(Decimal(intent["fee_jpy"]) + allocated_fee),
+                            str(exchange_id), intent["id"],
+                        ),
+                    )
+                db.execute(
+                    "UPDATE hedge_submissions SET status='RESOLVED',exchange_order_id=?,filled_qty=?,"
+                    "filled_notional=?,fee_jpy=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (
+                        str(exchange_id), str(filled_qty), str(filled_notional),
+                        str(fee_jpy), submission_id,
+                    ),
+                )
+                db.execute("COMMIT")
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
+        return self._hedge_submission_sync(submission_id)
+
+    async def set_hedge_submission_status(
+        self, submission_id: str, status: str, *, error: str | None = None,
+    ) -> HedgeSubmission:
+        return await asyncio.to_thread(
+            self._set_hedge_submission_status_sync, submission_id, status, error,
+        )
+
+    def _set_hedge_submission_status_sync(
+        self, submission_id: str, status: str, error: str | None,
+    ) -> HedgeSubmission:
+        if status not in ("ABSENT", "ESCALATE"):
+            raise ValueError("only terminal non-fill submission states may be set directly")
+        with self._lock:
+            db = self._db()
+            row = db.execute(
+                "SELECT status FROM hedge_submissions WHERE id=?", (submission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(submission_id)
+            if row["status"] not in ("SUBMITTING", "ACKED", status):
+                raise ValueError(f"cannot transition submission from {row['status']} to {status}")
+            db.execute(
+                "UPDATE hedge_submissions SET status=?,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, error, submission_id),
+            )
+        return self._hedge_submission_sync(submission_id)
+
+    async def pending_hedge_submissions(self) -> list[HedgeSubmission]:
+        return await asyncio.to_thread(self._pending_hedge_submissions_sync)
+
+    def _pending_hedge_submissions_sync(self) -> list[HedgeSubmission]:
+        with self._lock:
+            rows = self._db().execute(
+                "SELECT id FROM hedge_submissions WHERE trading_mode=? AND status IN ('SUBMITTING','ACKED') "
+                "ORDER BY submitted_at,id",
+                (self.trading_mode,),
+            ).fetchall()
+        return [self._hedge_submission_sync(str(row["id"])) for row in rows]
+
+    async def submissions_for_intent(self, intent_id: str) -> list[HedgeSubmission]:
+        return await asyncio.to_thread(self._submissions_for_intent_sync, intent_id)
+
+    def _submissions_for_intent_sync(self, intent_id: str) -> list[HedgeSubmission]:
+        with self._lock:
+            rows = self._db().execute(
+                "SELECT s.id FROM hedge_submissions s JOIN hedge_submission_intents si "
+                "ON si.submission_id=s.id WHERE si.intent_id=? ORDER BY s.submitted_at,s.id",
+                (intent_id,),
+            ).fetchall()
+        return [self._hedge_submission_sync(str(row["id"])) for row in rows]
+
+    def _hedge_submission_sync(self, submission_id: str) -> HedgeSubmission:
+        with self._lock:
+            db = self._db()
+            row = db.execute(
+                "SELECT * FROM hedge_submissions WHERE id=?", (submission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(submission_id)
+            intent_rows = db.execute(
+                "SELECT intent_id FROM hedge_submission_intents WHERE submission_id=? ORDER BY intent_id",
+                (submission_id,),
+            ).fetchall()
+        return HedgeSubmission(
+            id=str(row["id"]), symbol=str(row["symbol"]), side=str(row["side"]),
+            qty=Decimal(row["qty"]), execution_type=str(row["execution_type"]),
+            status=str(row["status"]), submitted_at=str(row["submitted_at"]),
+            intent_ids=tuple(str(item["intent_id"]) for item in intent_rows),
+            exchange_order_id=str(row["exchange_order_id"]) if row["exchange_order_id"] else None,
+            filled_qty=Decimal(row["filled_qty"]), filled_notional=Decimal(row["filled_notional"]),
+            fee_jpy=Decimal(row["fee_jpy"]), last_error=row["last_error"],
+        )
+
     async def pending_hedge_exposure(self) -> dict[str, Decimal]:
         return await asyncio.to_thread(self._pending_hedge_exposure_sync)
 
@@ -544,16 +806,17 @@ class StateStore:
 
     async def resolve_client_order_for_exchange_fill(
         self, exchange_order_id: str, *, symbol: str, side: str,
-        price: Decimal | None = None,
+        price: Decimal | None = None, occurred_at: str | None = None,
+        window_sec: int = 600,
     ) -> str | None:
         return await asyncio.to_thread(
             self._resolve_client_order_for_exchange_fill_sync,
-            exchange_order_id, symbol, side, price,
+            exchange_order_id, symbol, side, price, occurred_at, window_sec,
         )
 
     def _resolve_client_order_for_exchange_fill_sync(
         self, exchange_order_id: str, symbol: str, side: str,
-        price: Decimal | None,
+        price: Decimal | None, occurred_at: str | None, window_sec: int,
     ) -> str | None:
         """Bind an exchange id only when one unresolved local order is an exact safe match."""
         with self._lock:
@@ -565,14 +828,20 @@ class StateStore:
             if known is not None:
                 return str(known["client_order_id"])
             rows = db.execute(
-                "SELECT client_order_id,price FROM orders WHERE trading_mode=? "
+                "SELECT client_order_id,price,created_at FROM orders WHERE trading_mode=? "
                 "AND exchange_order_id IS NULL AND state IN (?,?) AND symbol=? AND side=?",
                 (
                     self.trading_mode, OrderState.PLACING, OrderState.UNKNOWN,
                     symbol, side,
                 ),
             ).fetchall()
-            candidates = [row for row in rows if price is None or Decimal(row["price"]) == price]
+            observed = self._parse_timestamp(occurred_at) if occurred_at else None
+            candidates = [
+                row for row in rows
+                if (price is None or Decimal(row["price"]) == price)
+                and observed is not None
+                and abs((observed - self._parse_timestamp(row["created_at"])).total_seconds()) <= window_sec
+            ]
             if len(candidates) != 1:
                 return None
             client_order_id = str(candidates[0]["client_order_id"])
@@ -586,6 +855,11 @@ class StateStore:
                 ),
             )
             return client_order_id
+
+    @staticmethod
+    def _parse_timestamp(value: str) -> datetime:
+        result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return result if result.tzinfo else result.replace(tzinfo=timezone.utc)
 
     async def trading_projection(self, symbol: str | None = None,
                                  trading_mode: str | None = None) -> list[dict]:

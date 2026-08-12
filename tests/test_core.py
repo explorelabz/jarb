@@ -6,6 +6,7 @@ import sys
 import pytest
 
 import backend.core as core_module
+from backend import core_fallback
 from backend.core import make_quotes, matched_trade, opposite_side, reconcile, validate_config
 from backend.models import ClientFill, HedgeFill, MarketTop, StrategyConfig, gmo_taker_bps
 
@@ -99,3 +100,25 @@ def test_core_imports_and_operates_without_optional_rust_extension(monkeypatch):
         )
         assert [quote.price for quote in quotes] == [24.098, 24.152]
     importlib.reload(core_module)
+
+
+def test_rust_and_decimal_fallback_outputs_are_consistent():
+    native = pytest.importorskip("hedge_core")
+    cases = [
+        (100, 101, [(100, .1), (99.99, .2)], [(101, .1), (101.01, .2)], 8, .25, .01, 5),
+        (24.123, 24.127, [(24.123, 100)], [(24.127, 100)], 10, 10, .001, 3),
+        (17_400_000, 17_410_000, [(17_400_000, .02)], [(17_410_000, .03)], 25, .05, 1, 3),
+    ]
+    for args in cases:
+        native_rows = native.make_quotes(*args)
+        fallback_rows = core_fallback.make_quotes(*args)
+        for native_row, fallback_row in zip(native_rows, fallback_rows, strict=True):
+            assert native_row[0] == fallback_row[0]
+            assert native_row[1:] == pytest.approx(fallback_row[1:], abs=1e-10)
+    assert native.trade_pnl("BUY", 100, 101, .125, .01, .02) == pytest.approx(
+        core_fallback.trade_pnl("BUY", 100, 101, .125, .01, .02), abs=1e-12,
+    )
+    rows = [("BUY", .100000005), ("SELL", .05)]
+    assert native.reconcile(rows, [("SELL", .050000005)]) == pytest.approx(
+        core_fallback.reconcile(rows, [("SELL", .050000005)]), abs=1e-12,
+    )

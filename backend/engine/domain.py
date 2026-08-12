@@ -9,6 +9,14 @@ class HedgePreconditionError(RuntimeError):
     """A local safety check failed before an exchange order was submitted."""
 
 
+class HedgeSubmissionUnknown(RuntimeError):
+    """A durable submission exists but exchange acceptance is not yet reconciled."""
+
+    def __init__(self, submission_id: str, message: str):
+        super().__init__(message)
+        self.submission_id = submission_id
+
+
 class OrderState(StrEnum):
     NEW = "NEW"
     PLACING = "PLACING"
@@ -90,3 +98,20 @@ class HedgeIntent:
     created_at: str
     source_fill_at: str
     exchange_order_id: str | None = None
+
+
+@dataclass(frozen=True)
+class HedgeSubmission:
+    id: str
+    symbol: str
+    side: str
+    qty: Decimal
+    execution_type: str
+    status: str
+    submitted_at: str
+    intent_ids: tuple[str, ...]
+    exchange_order_id: str | None = None
+    filled_qty: Decimal = Decimal("0")
+    filled_notional: Decimal = Decimal("0")
+    fee_jpy: Decimal = Decimal("0")
+    last_error: str | None = None

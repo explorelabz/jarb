@@ -60,13 +60,17 @@ npm run dev
 
 打开 <http://127.0.0.1:5173>。默认运行 Paper 模式，不需要 API Key。Paper 会自动完成恢复、以 `ARM JARB PAPER` 走完整 Arm 门禁，然后由 Fake 交易所撮合真实引擎挂单。设置页可开关部分成交、dust、重复/乱序、撤单竞速、GMO 部分 FAK、成交延迟、post-only 拒单、429 与网络超时等故障注入。
 
-控制面必须配置具名操作员 Token，除 `/api/health` 外的所有 API、SSE 和导出均要求 `Authorization: Bearer <token>`。控制台首次打开会提示输入 Token，并仅保存在当前标签页的 `sessionStorage`；不要把 Token 放进 URL：
+控制面必须配置具名操作员 Token，除 `/api/health` 外的所有 API、SSE 和导出均要求 `Authorization: Bearer <token>`。控制台首次打开会提示输入 Token，Token 只保存在页面内存中、刷新即清除；不要把 Token 放进 URL：
 
 ```dotenv
 JARB_OPERATOR_TOKENS="alice=<至少32字符的随机token>,bob=<另一个至少32字符的随机token>"
 ```
 
 每个 Token 必须唯一绑定一个真实操作员。启用双人 Arm 时，第二次确认必须换用另一位操作员的 Token；请求体里的自报姓名不会被接受。
+
+Live 控制面不要直接暴露公网。后端应仅绑定 loopback，通过 SSH 隧道访问，或在 Nginx 前配置 mTLS。应用 CSP 只是纵深防御，不能替代网络隔离。
+
+修改交易所凭据或风控限额采用独立的双人审批：第一位操作员 PATCH 后收到 HTTP 202 和 `approvalId`；第二位操作员从自己的浏览器或 CLI 调用 `POST /api/approvals/<approvalId>/approve`；随后任一参与者在五分钟内携带 `X-JARB-Approval: <approvalId>` 重放完全相同的 PATCH。第二人的 Token 不应输入第一人的页面。
 
 API Key 也可继续通过环境变量注入：
 

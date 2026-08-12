@@ -20,8 +20,9 @@ const price = (value: number, tick: number) => new Intl.NumberFormat('ja-JP', {
 const blendedGmoFee = (config: SystemState['config']) => config.gmoMakerFeeBps * config.expectedPassiveFillRatio
   + config.gmoFeeBps * (1 - config.expectedPassiveFillRatio)
 
-const operatorTokenKey = 'jarb.operatorToken'
-const setOperatorToken = (token: string) => window.sessionStorage.setItem(operatorTokenKey, token.trim())
+let operatorToken = ''
+const pendingApprovals: Record<string, string> = {}
+const setOperatorToken = (token: string) => { operatorToken = token.trim() }
 const promptOperatorToken = (message = '输入操作员访问 Token') => {
   const token = window.prompt(message)?.trim() ?? ''
   if (token) setOperatorToken(token)
@@ -29,7 +30,7 @@ const promptOperatorToken = (message = '输入操作员访问 Token') => {
 }
 
 async function authorizedFetch(path: string, init?: RequestInit, retry = true): Promise<Response> {
-  let token = window.sessionStorage.getItem(operatorTokenKey) ?? ''
+  let token = operatorToken
   if (!token) token = promptOperatorToken()
   if (!token) throw new Error('需要操作员 Token')
   const response = await fetch(path, {
@@ -37,7 +38,7 @@ async function authorizedFetch(path: string, init?: RequestInit, retry = true): 
     headers: { Authorization: `Bearer ${token}`, ...init?.headers },
   })
   if (response.status === 401 && retry) {
-    window.sessionStorage.removeItem(operatorTokenKey)
+    operatorToken = ''
     const replacement = promptOperatorToken('Token 无效或已轮换，请重新输入操作员访问 Token')
     if (!replacement) return response
     return authorizedFetch(path, init, false)
@@ -46,10 +47,20 @@ async function authorizedFetch(path: string, init?: RequestInit, retry = true): 
 }
 
 async function api(path: string, init?: RequestInit) {
+  const approvalId = pendingApprovals[path]
   const response = await authorizedFetch(path, {
-    ...init, headers: { 'Content-Type': 'application/json', ...init?.headers },
+    ...init, headers: {
+      'Content-Type': 'application/json',
+      ...(approvalId ? { 'X-JARB-Approval': approvalId } : {}),
+      ...init?.headers,
+    },
   })
   const data = await response.json()
+  if (data.approvalRequired && data.approvalId) {
+    pendingApprovals[path] = data.approvalId
+    throw new Error(`${data.message}。审批 ID：${data.approvalId}`)
+  }
+  if (response.ok && approvalId) delete pendingApprovals[path]
   if (!response.ok) throw new Error(data.error ?? data.detail ?? '请求失败')
   return data
 }
@@ -511,10 +522,6 @@ export function App() {
       if (risk?.armed) {
         result = await api('/api/risk/disarm', { method: 'POST' })
       } else {
-        if (risk?.pendingArmActor) {
-          const token = promptOperatorToken(`第一位操作员：${risk.pendingArmActor}。请输入另一位操作员的访问 Token`)
-          if (!token) return
-        }
         const phrase = window.prompt('输入实盘确认短语')
         if (!phrase) return
         result = await api('/api/risk/arm', { method: 'POST', body: JSON.stringify({ phrase }) })

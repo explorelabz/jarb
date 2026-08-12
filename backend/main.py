@@ -6,11 +6,11 @@ import io
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .auth import authenticate_request, current_operator
+from .auth import authenticate_request, current_operator, sensitive_approvals
 
 from .config import (
     credentials, gmo_fee_overrides, gmo_maker_fee_overrides, requested_mode,
@@ -46,9 +46,59 @@ app = FastAPI(
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["GET", "POST", "PATCH"], allow_headers=["*"])
 
 
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+        "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
+
+async def sensitive_change(
+    action: str, payload: bytes, actor: str, approval_id: str | None,
+) -> JSONResponse | None:
+    if not approval_id:
+        approval = sensitive_approvals.begin(action, payload, actor)
+        await service.state_store.audit(
+            "sensitive.approval.requested", "critical",
+            f"two-person approval requested for {action}", actor=actor,
+            metadata={"approvalId": approval.id, "expiresAt": approval.expires_at},
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "approvalRequired": True, "approvalId": approval.id,
+                "expiresAt": approval.expires_at,
+                "message": "请由另一位操作员从独立浏览器或 CLI 复核，再携带审批 ID 重试原请求",
+            },
+        )
+    try:
+        approval = sensitive_approvals.consume(approval_id, action, payload, actor)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await service.state_store.audit(
+        "sensitive.approval.consumed", "critical",
+        f"two-person approval consumed for {action}", actor=actor,
+        metadata={
+            "approvalId": approval.id, "firstActor": approval.first_actor,
+            "secondActor": approval.second_actor,
+        },
+    )
+    return None
+
+
 @app.get("/api/state")
 async def state():
-    return service.state
+    return {
+        **service.state.model_dump(),
+        "runtime": {"language": "Python", "core": core_runtime()},
+    }
 
 
 @app.get("/api/events")
@@ -60,9 +110,9 @@ async def events():
 
 
 @app.patch("/api/strategy")
-async def update_strategy(patch: dict):
+async def update_strategy(patch: dict, actor: str = Depends(current_operator)):
     try:
-        await service.configure(patch)
+        await service.configure(patch, actor=actor)
         return service.state
     except (ValueError, TypeError) as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -83,9 +133,18 @@ async def connection():
 
 
 @app.patch("/api/connection")
-async def update_connection(update: ConnectionUpdate):
+async def update_connection(
+    update: ConnectionUpdate, actor: str = Depends(current_operator),
+    approval_id: str | None = Header(default=None, alias="X-JARB-Approval"),
+):
     try:
-        await service.configure_connection(update)
+        pending = await sensitive_change(
+            "connection.update", update.model_dump_json(exclude_unset=True).encode(),
+            actor, approval_id,
+        )
+        if pending is not None:
+            return pending
+        await service.configure_connection(update, actor=actor)
         return service.connection_summary()
     except (ValueError, TypeError) as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -111,8 +170,33 @@ async def risk_limits_config():
 
 
 @app.patch("/api/risk/limits")
-async def update_risk_limits(update: RiskLimitsUpdate):
-    return await service.configure_risk_limits(update)
+async def update_risk_limits(
+    update: RiskLimitsUpdate, actor: str = Depends(current_operator),
+    approval_id: str | None = Header(default=None, alias="X-JARB-Approval"),
+):
+    pending = await sensitive_change(
+        "risk.limits.update", update.model_dump_json(exclude_unset=True).encode(),
+        actor, approval_id,
+    )
+    if pending is not None:
+        return pending
+    return await service.configure_risk_limits(update, actor=actor)
+
+
+@app.post("/api/approvals/{approval_id}/approve")
+async def approve_sensitive_change(
+    approval_id: str, actor: str = Depends(current_operator),
+):
+    try:
+        approval = sensitive_approvals.approve(approval_id, actor)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await service.state_store.audit(
+        "sensitive.approval.second", "critical",
+        f"second operator approved {approval.action}", actor=actor,
+        metadata={"approvalId": approval.id, "firstActor": approval.first_actor},
+    )
+    return {"approved": True, "approvalId": approval.id, "action": approval.action}
 
 
 @app.post("/api/risk/arm")
@@ -134,11 +218,12 @@ async def inventory():
 
 
 @app.patch("/api/inventory")
-async def update_inventory(update: InventoryUpdate):
+async def update_inventory(update: InventoryUpdate, actor: str = Depends(current_operator)):
     try:
         return await service.configure_inventory(
             update.bittrade, update.gmo,
             webhook_url=update.webhookUrl, clear_webhook=update.clearWebhook,
+            actor=actor,
         )
     except (ValueError, TypeError) as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -164,9 +249,11 @@ async def paper_scenarios():
 
 
 @app.patch("/api/paper/scenarios")
-async def update_paper_scenarios(update: PaperScenarioUpdate):
+async def update_paper_scenarios(
+    update: PaperScenarioUpdate, actor: str = Depends(current_operator),
+):
     try:
-        return await service.configure_paper_scenarios(update)
+        return await service.configure_paper_scenarios(update, actor=actor)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -202,5 +289,4 @@ async def export_orders(format: str = "csv", mode: str = "all"):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "mode": service.state.mode, "connection": service.state.connection.status,
-            "activeSymbols": service.state.activeSymbols, "runtime": "Python", "core": core_runtime()}
+    return {"ok": True}

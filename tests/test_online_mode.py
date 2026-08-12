@@ -144,6 +144,20 @@ def paper_market_adapters() -> dict:
 
 
 @pytest.mark.asyncio
+async def test_live_arm_refuses_python_fallback_core(tmp_path, monkeypatch):
+    monkeypatch.setattr("backend.service.NATIVE_CORE_AVAILABLE", False)
+    service = TradingService(
+        StrategyConfig(), mode="live", gmo=FakeGmo(), bittrade=FakeBittrade(),
+        db_path=tmp_path / "state.db",
+    )
+    await service.state_store.initialize()
+    with pytest.raises(ValueError, match="Rust/PyO3"):
+        await service.arm("irrelevant", "alice")
+    await service.state_store.close()
+    await service.notifier.close()
+
+
+@pytest.mark.asyncio
 async def test_execution_price_keeps_exchange_decimal_and_delta_breach_kills_risk_gate(tmp_path):
     service = TradingService(
         StrategyConfig(deltaLimit=.005), mode="paper", gmo=FakeGmo(), bittrade=FakeBittrade(),

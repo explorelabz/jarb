@@ -5,13 +5,16 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Protocol
 
-from ..adapters import GmoAdapter
+from ..adapters import ExchangeAPIError, GmoAdapter
 from ..models import Side
-from .domain import EventType, HedgeIntent, HedgePreconditionError, HedgeStatus
+from .domain import (
+    EventType, HedgeIntent, HedgePreconditionError, HedgeStatus,
+    HedgeSubmission, HedgeSubmissionUnknown,
+)
 from .events import EventBus
 from .rate_limit import EndpointGroup, Priority, PriorityRateLimiter
 from .risk import RiskGate
@@ -26,6 +29,12 @@ class HedgeExecution:
     fee_jpy: Decimal = Decimal("0")
     submitted_at: str = ""
     confirmed_at: str = ""
+
+
+@dataclass(frozen=True)
+class HedgeSubmissionRecovery:
+    order_id: str
+    execution: HedgeExecution
 
 
 class HedgeExecutor(Protocol):
@@ -72,6 +81,7 @@ class HedgeWorker:
                     "hedge.intent.recovered", "critical",
                     f"recreated {repaired} missing hedge intent(s) from durable fills",
                 )
+            await self._recover_durable_submissions()
             await self._recover_inflight()
             self._fill_queue = self.events.open_queue(EventType.FILL)
             self._listener = asyncio.create_task(self._listen(), name="hedge-fill-listener")
@@ -80,10 +90,27 @@ class HedgeWorker:
                 self._wake.set()
 
     async def _recover_inflight(self) -> None:
+        pending_submission_intents = {
+            intent_id for submission in await self.store.pending_hedge_submissions()
+            for intent_id in submission.intent_ids
+        }
         grouped: dict[str | None, list[HedgeIntent]] = defaultdict(list)
         for intent in await self.store.pending_hedges():
-            if intent.status == HedgeStatus.HEDGING:
-                grouped[intent.exchange_order_id].append(intent)
+            if intent.status != HedgeStatus.HEDGING or intent.id in pending_submission_intents:
+                continue
+            submissions = await self.store.submissions_for_intent(intent.id)
+            latest = submissions[-1] if submissions else None
+            if (
+                latest is not None and latest.status == "RESOLVED"
+                and latest.exchange_order_id == intent.exchange_order_id
+            ):
+                target = HedgeStatus.HEDGED if intent.filled_qty >= intent.qty else HedgeStatus.RETRY
+                await self.store.transition_hedge(
+                    intent.id, target,
+                    error=None if target == HedgeStatus.HEDGED else "resolved durable submission was partial",
+                )
+                continue
+            grouped[intent.exchange_order_id].append(intent)
         for order_id, intents in grouped.items():
             if self.resolver is None or order_id is None:
                 for intent in intents:
@@ -125,6 +152,60 @@ class HedgeWorker:
                         error=None if target == HedgeStatus.HEDGED else "recovered partial hedge",
                     )
 
+    async def _recover_durable_submissions(self) -> None:
+        submissions = await self.store.pending_hedge_submissions()
+        if not submissions:
+            return
+        recover = getattr(self.executor, "recover_submission", None)
+        if recover is None:
+            await self.risk.disarm("durable hedge submission recovery is unavailable")
+            return
+        for submission in submissions:
+            try:
+                recovered: HedgeSubmissionRecovery | None = await recover(submission)
+            except Exception as exc:
+                await self.store.audit(
+                    "hedge.submission.unresolved", "critical",
+                    f"{submission.id} remains unresolved: {str(exc)[:200]}",
+                    metadata={
+                        "symbol": submission.symbol, "side": submission.side,
+                        "qty": str(submission.qty), "submittedAt": submission.submitted_at,
+                    },
+                )
+                await self.risk.disarm(
+                    f"manual reconciliation required for hedge submission {submission.id}"
+                )
+                continue
+            if recovered is None:
+                await self.store.set_hedge_submission_status(
+                    submission.id, "ABSENT", error="exchange history proved no matching order",
+                )
+            else:
+                if not submission.exchange_order_id:
+                    await self.store.acknowledge_hedge_submission(
+                        submission.id, recovered.order_id,
+                    )
+                execution = recovered.execution
+                await self.store.finish_hedge_submission(
+                    submission.id, order_id=recovered.order_id,
+                    filled_qty=execution.filled_qty,
+                    filled_notional=execution.filled_notional,
+                    fee_jpy=execution.fee_jpy,
+                )
+            for intent_id in submission.intent_ids:
+                intent = await self.store.hedge_intent(intent_id)
+                if intent is None or intent.status != HedgeStatus.HEDGING:
+                    continue
+                target = HedgeStatus.HEDGED if intent.filled_qty >= intent.qty else HedgeStatus.RETRY
+                await self.store.transition_hedge(
+                    intent.id, target,
+                    error=None if target == HedgeStatus.HEDGED else "durable submission recovered",
+                    exchange_order_id=(recovered.order_id if recovered else None),
+                    latency_ms=self._latency_ms(
+                        intent, recovered.execution.confirmed_at if recovered else "",
+                    ),
+                )
+
     async def stop(self) -> None:
         active = tuple(task for tasks in self._active_groups.values() for task in tasks)
         for task in active:
@@ -163,8 +244,12 @@ class HedgeWorker:
                 pass
             self._wake.clear()
             grouped: dict[tuple[str, str], list[HedgeIntent]] = defaultdict(list)
+            blocked_ids = {
+                intent_id for submission in await self.store.pending_hedge_submissions()
+                for intent_id in submission.intent_ids
+            }
             for intent in await self.store.pending_hedges():
-                if intent.id in self._active_intents:
+                if intent.id in self._active_intents or intent.id in blocked_ids:
                     continue
                 grouped[(intent.symbol, intent.side)].append(intent)
             now = loop.time()
@@ -241,6 +326,45 @@ class HedgeWorker:
         if active_qty <= 0:
             return
         checkpointed_order_id: str | None = None
+        durable_submissions = hasattr(self.executor, "set_submission_hooks")
+        if durable_submissions:
+            async def prepare_submission(
+                execution_type: str, submission_qty: Decimal, submitted_at: str,
+            ) -> str:
+                submission = await self.store.prepare_hedge_submission(
+                    [intent.id for intent in active], symbol=symbol, side=side,
+                    qty=submission_qty, execution_type=execution_type,
+                    submitted_at=submitted_at,
+                )
+                return submission.id
+
+            async def acknowledge_submission(submission_id: str, order_id: str) -> None:
+                nonlocal checkpointed_order_id
+                checkpointed_order_id = order_id
+                await self.store.acknowledge_hedge_submission(submission_id, order_id)
+                for intent in active:
+                    await self.store.transition_hedge(
+                        intent.id, HedgeStatus.HEDGING, exchange_order_id=order_id,
+                    )
+
+            async def complete_submission(
+                submission_id: str, order_id: str, filled_qty: Decimal,
+                filled_notional: Decimal, fee_jpy: Decimal,
+            ) -> None:
+                await self.store.finish_hedge_submission(
+                    submission_id, order_id=order_id, filled_qty=filled_qty,
+                    filled_notional=filled_notional, fee_jpy=fee_jpy,
+                )
+
+            async def reject_submission(submission_id: str, error: str) -> None:
+                await self.store.set_hedge_submission_status(
+                    submission_id, "ABSENT", error=error[:240],
+                )
+
+            self.executor.set_submission_hooks(
+                prepare_submission, acknowledge_submission, complete_submission,
+                reject_submission,
+            )
         if hasattr(self.executor, "set_checkpoint"):
             async def checkpoint(order_id: str, filled_qty: Decimal = Decimal("0"),
                                  filled_notional: Decimal = Decimal("0"),
@@ -276,14 +400,13 @@ class HedgeWorker:
                     "exchangeOrderId": checkpointed_order_id,
                 },
             )
-            if checkpointed_order_id is not None:
+            if isinstance(exc, HedgeSubmissionUnknown):
                 for intent in active:
                     await self.store.transition_hedge(
                         intent.id, HedgeStatus.HEDGING,
-                        exchange_order_id=checkpointed_order_id, error=str(exc)[:240],
+                        error=f"unresolved durable submission {exc.submission_id}: {str(exc)[:160]}",
                     )
-                await self.risk.disarm(f"unresolved hedge order {checkpointed_order_id} for {symbol}")
-                self._wake.set()
+                await self.risk.disarm(f"unresolved hedge submission {exc.submission_id} for {symbol}")
                 return
             if isinstance(exc, HedgePreconditionError):
                 for intent in active:
@@ -291,6 +414,15 @@ class HedgeWorker:
                         intent.id, HedgeStatus.RETRY, error=str(exc)[:240],
                     )
                 await self.risk.disarm(f"hedge precondition failed for {symbol}")
+                self._wake.set()
+                return
+            if checkpointed_order_id is not None:
+                for intent in active:
+                    await self.store.transition_hedge(
+                        intent.id, HedgeStatus.HEDGING,
+                        exchange_order_id=checkpointed_order_id, error=str(exc)[:240],
+                    )
+                await self.risk.disarm(f"unresolved hedge order {checkpointed_order_id} for {symbol}")
                 self._wake.set()
                 return
             # Without an order id a response timeout is still ambiguous: GMO may have
@@ -301,6 +433,24 @@ class HedgeWorker:
                     error=f"ambiguous hedge submission: {str(exc)[:200]}",
                 )
             await self.risk.disarm(f"manual hedge reconciliation required for {symbol}")
+            return
+
+        if durable_submissions:
+            refreshed = [await self.store.hedge_intent(intent.id) for intent in active]
+            for intent in refreshed:
+                if intent is None:
+                    continue
+                target = HedgeStatus.HEDGED if intent.filled_qty >= intent.qty else HedgeStatus.RETRY
+                await self.store.transition_hedge(
+                    intent.id, target,
+                    latency_ms=self._latency_ms(intent, result.confirmed_at),
+                    exchange_order_id=result.order_id,
+                    error=None if target == HedgeStatus.HEDGED else "GMO hedge partially filled",
+                )
+            if self.on_execution is not None and result.filled_qty > 0:
+                await self.on_execution(symbol, side, result)
+            if result.filled_qty < active_qty:
+                self._wake.set()
             return
 
         available = result.filled_qty
@@ -408,7 +558,8 @@ class GmoHedgeExecutor:
                  maker_fee_bps: dict[str, Decimal] | None = None,
                  taker_fee_bps: dict[str, Decimal] | None = None,
                  passive_timeout_ms: dict[str, int] | None = None,
-                 fill_timeout_sec: float = 5.0):
+                 fill_timeout_sec: float = 5.0,
+                 orphan_recovery_grace_sec: float = 15.0):
         self.adapter = adapter
         self.limiter = limiter
         self.size_steps = size_steps
@@ -418,14 +569,47 @@ class GmoHedgeExecutor:
         self.taker_fee_bps = taker_fee_bps or {}
         self.passive_timeout_ms = passive_timeout_ms or {}
         self.fill_timeout_sec = fill_timeout_sec
+        self.orphan_recovery_grace_sec = max(0.0, orphan_recovery_grace_sec)
         self._checkpoint: ContextVar[
             Callable[[str, Decimal, Decimal, Decimal], Awaitable[None]] | None
         ] = ContextVar(
             "gmo_hedge_checkpoint", default=None,
         )
+        self._submission_hooks: ContextVar[
+            tuple[Callable, Callable, Callable, Callable] | None
+        ] = ContextVar(
+            "gmo_hedge_submission_hooks", default=None,
+        )
 
     def set_checkpoint(self, callback: Callable[[str, Decimal, Decimal, Decimal], Awaitable[None]]) -> None:
         self._checkpoint.set(callback)
+
+    def set_submission_hooks(
+        self, prepare: Callable[[str, Decimal, str], Awaitable[str]],
+        acknowledge: Callable[[str, str], Awaitable[None]],
+        complete: Callable[[str, str, Decimal, Decimal, Decimal], Awaitable[None]],
+        reject: Callable[[str, str], Awaitable[None]],
+    ) -> None:
+        self._submission_hooks.set((prepare, acknowledge, complete, reject))
+
+    async def _prepare_submission(
+        self, execution_type: str, qty: Decimal, submitted_at: str,
+    ) -> str | None:
+        hooks = self._submission_hooks.get()
+        return await hooks[0](execution_type, qty, submitted_at) if hooks else None
+
+    async def _acknowledge_submission(self, submission_id: str | None, order_id: str) -> None:
+        hooks = self._submission_hooks.get()
+        if hooks and submission_id:
+            await hooks[1](submission_id, order_id)
+
+    async def _complete_submission(
+        self, submission_id: str | None, order_id: str, filled_qty: Decimal,
+        filled_notional: Decimal, fee_jpy: Decimal,
+    ) -> None:
+        hooks = self._submission_hooks.get()
+        if hooks and submission_id:
+            await hooks[2](submission_id, order_id, filled_qty, filled_notional, fee_jpy)
 
     async def __call__(self, symbol: str, side: str, qty: Decimal) -> HedgeExecution:
         if self.passive_price is None or not hasattr(self.adapter, "post_only_order"):
@@ -437,16 +621,35 @@ class GmoHedgeExecutor:
         step = self.size_steps.get(symbol, Decimal("0.00000001"))
         tick = self.price_ticks.get(symbol, Decimal("1"))
         passive_price = self.passive_price(symbol, side)
-        response = await self.limiter.submit(
-            EndpointGroup.HEDGE, Priority.CRITICAL,
-            lambda: self.adapter.post_only_order(
-                symbol, side, qty, passive_price, step, tick,
-            ),
-        )
+        passive_submission = await self._prepare_submission("SOK", qty, submitted_at)
+        try:
+            response = await self.limiter.submit(
+                EndpointGroup.HEDGE, Priority.CRITICAL,
+                lambda: self.adapter.post_only_order(
+                    symbol, side, qty, passive_price, step, tick,
+                ),
+            )
+        except HedgePreconditionError as exc:
+            if passive_submission:
+                await self.store_submission_absent(passive_submission, str(exc))
+            raise
+        except ExchangeAPIError as exc:
+            if passive_submission:
+                # A structured exchange rejection proves no order was accepted.
+                await self.store_submission_absent(passive_submission, str(exc))
+            raise HedgePreconditionError(str(exc)) from exc
+        except Exception as exc:
+            if passive_submission:
+                raise HedgeSubmissionUnknown(passive_submission, str(exc)) from exc
+            raise
         passive_id = self._order_id(response)
         if not passive_id:
+            if passive_submission:
+                raise HedgeSubmissionUnknown(passive_submission, "GMO SOK response had no order id")
             raise RuntimeError("GMO hedge response had no order id")
-        await self._checkpoint_order(passive_id)
+        await self._acknowledge_submission(passive_submission, passive_id)
+        if not passive_submission:
+            await self._checkpoint_order(passive_id)
         passive_filled, passive_notional, terminal = await self._watch_passive(
             passive_id, qty, passive_price,
             timeout_sec=self.passive_timeout_ms.get(symbol, 800) / 1000,
@@ -456,6 +659,9 @@ class GmoHedgeExecutor:
                 passive_id, qty, passive_price,
             )
         passive_fee = passive_notional * self.maker_fee_bps.get(symbol, Decimal("-1")) / Decimal("10000")
+        await self._complete_submission(
+            passive_submission, passive_id, passive_filled, passive_notional, passive_fee,
+        )
         remaining = max(Decimal("0"), qty - passive_filled)
         if remaining <= 0:
             return HedgeExecution(
@@ -483,21 +689,45 @@ class GmoHedgeExecutor:
                                 carried_fee: Decimal = Decimal("0"),
                                 submitted_at: str = "") -> HedgeExecution:
         submitted_at = submitted_at or datetime.now(timezone.utc).isoformat()
-        response = await self.limiter.submit(
-            EndpointGroup.HEDGE, Priority.CRITICAL,
-            lambda: self.adapter.market_order(
-                symbol, side, qty, self.size_steps.get(symbol, Decimal("0.00000001")),
-            ),
-        )
+        submission_id = await self._prepare_submission("FAK", qty, submitted_at)
+        try:
+            response = await self.limiter.submit(
+                EndpointGroup.HEDGE, Priority.CRITICAL,
+                lambda: self.adapter.market_order(
+                    symbol, side, qty, self.size_steps.get(symbol, Decimal("0.00000001")),
+                ),
+            )
+        except HedgePreconditionError as exc:
+            if submission_id:
+                await self.store_submission_absent(submission_id, str(exc))
+            raise
+        except ExchangeAPIError as exc:
+            if submission_id:
+                await self.store_submission_absent(submission_id, str(exc))
+            raise HedgePreconditionError(str(exc)) from exc
+        except Exception as exc:
+            if submission_id:
+                raise HedgeSubmissionUnknown(submission_id, str(exc)) from exc
+            raise
         order_id = self._order_id(response)
         if not order_id:
+            if submission_id:
+                raise HedgeSubmissionUnknown(submission_id, "GMO FAK response had no order id")
             raise RuntimeError("GMO hedge response had no order id")
-        await self._checkpoint_order(order_id, carried_qty, carried_notional, carried_fee)
+        await self._acknowledge_submission(submission_id, order_id)
+        if not submission_id:
+            await self._checkpoint_order(order_id, carried_qty, carried_notional, carried_fee)
         filled, notional, confirmed_at = await self._await_fills(
             order_id, qty, timeout_sec=self.fill_timeout_sec,
         )
         fee = notional * self.taker_fee_bps.get(symbol, Decimal("9")) / Decimal("10000")
+        await self._complete_submission(submission_id, order_id, filled, notional, fee)
         return HedgeExecution(order_id, filled, notional, fee, submitted_at, confirmed_at)
+
+    async def store_submission_absent(self, submission_id: str, error: str) -> None:
+        hooks = self._submission_hooks.get()
+        if hooks:
+            await hooks[3](submission_id, error)
 
     async def resolve(self, intent: HedgeIntent) -> HedgeExecution | None:
         if not intent.exchange_order_id:
@@ -552,6 +782,187 @@ class GmoHedgeExecutor:
             intent.exchange_order_id, filled, notional, notional * fee_bps / Decimal("10000"),
             submitted_at=intent.created_at, confirmed_at=confirmed_at,
         )
+
+    async def recover_submission(
+        self, submission: HedgeSubmission,
+    ) -> HedgeSubmissionRecovery | None:
+        """Recover ACKED or response-lost submissions without issuing a new order."""
+        if submission.exchange_order_id:
+            execution = await self._recover_known_submission(
+                submission, submission.exchange_order_id,
+            )
+            return HedgeSubmissionRecovery(submission.exchange_order_id, execution)
+        order_id, execution = await self._find_orphan_submission(submission)
+        if order_id is None:
+            return None
+        if execution is None:
+            execution = await self._recover_known_submission(submission, order_id)
+        return HedgeSubmissionRecovery(order_id, execution)
+
+    async def _recover_known_submission(
+        self, submission: HedgeSubmission, order_id: str,
+    ) -> HedgeExecution:
+        submitted_at = submission.submitted_at
+        if submission.execution_type == "SOK":
+            detail = await self._order_detail(order_id)
+            price = Decimal(str(detail.get("price", "0") or "0"))
+            status = str(detail.get("status", "")).upper()
+            if status not in ("EXECUTED", "CANCELED", "EXPIRED"):
+                filled, notional = await self._cancel_passive(order_id, submission.qty, price)
+            else:
+                filled, notional = await self._execution_snapshot(order_id)
+                executed = Decimal(str(detail.get("executedSize", "0") or "0"))
+                if executed > filled:
+                    filled, notional = executed, executed * price
+            fee = notional * self.maker_fee_bps.get(submission.symbol, Decimal("-1")) / Decimal("10000")
+            return HedgeExecution(
+                order_id, filled, notional, fee, submitted_at,
+                datetime.now(timezone.utc).isoformat(),
+            )
+        filled, notional, confirmed_at = await self._await_fills(
+            order_id, submission.qty, timeout_sec=self.fill_timeout_sec,
+        )
+        fee = notional * self.taker_fee_bps.get(submission.symbol, Decimal("9")) / Decimal("10000")
+        return HedgeExecution(order_id, filled, notional, fee, submitted_at, confirmed_at)
+
+    async def _find_orphan_submission(
+        self, submission: HedgeSubmission,
+    ) -> tuple[str | None, HedgeExecution | None]:
+        if not hasattr(self.adapter, "latest_executions") or not hasattr(self.adapter, "active_orders"):
+            raise RuntimeError("GMO orphan-order history APIs are unavailable")
+        submitted = datetime.fromisoformat(submission.submitted_at.replace("Z", "+00:00"))
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - submitted > timedelta(hours=23):
+            raise RuntimeError("submission is older than GMO latestExecutions retention")
+        age_sec = (datetime.now(timezone.utc) - submitted).total_seconds()
+        if age_sec < self.orphan_recovery_grace_sec:
+            await asyncio.sleep(self.orphan_recovery_grace_sec - max(0.0, age_sec))
+        lower = submitted - timedelta(seconds=15)
+        upper = submitted + timedelta(minutes=5)
+        execution_rows, executions_covered = await self._paged_recovery_rows(
+            lambda page: self.adapter.latest_executions(
+                submission.symbol, page=page, count=100,
+            ), lower,
+        )
+        active_rows, active_covered = await self._paged_recovery_rows(
+            lambda page: self.adapter.active_orders(
+                submission.symbol, page=page, count=100,
+            ), lower,
+        )
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for row in execution_rows:
+            if str(row.get("side", "")).upper() != submission.side:
+                continue
+            timestamp = self._exchange_timestamp(row.get("timestamp"))
+            if timestamp is None or not lower <= timestamp <= upper:
+                continue
+            order_id = row.get("orderId", row.get("order-id"))
+            if order_id is not None:
+                grouped[str(order_id)].append(row)
+        active_candidates: set[str] = set()
+        for row in active_rows:
+            timestamp = self._exchange_timestamp(row.get("timestamp"))
+            execution_type = str(row.get("executionType", "")).upper()
+            time_in_force = str(row.get("timeInForce", "")).upper()
+            if (
+                timestamp is not None and lower <= timestamp <= upper
+                and str(row.get("side", "")).upper() == submission.side
+                and Decimal(str(row.get("size", "0"))) == submission.qty
+                and (
+                    submission.execution_type == "FAK" and execution_type == "MARKET"
+                    or submission.execution_type == "SOK" and time_in_force == "SOK"
+                )
+            ):
+                order_id = row.get("orderId", row.get("order-id"))
+                if order_id is not None:
+                    active_candidates.add(str(order_id))
+        execution_candidates: set[str] = set()
+        for order_id, rows in grouped.items():
+            total = sum((Decimal(str(row.get("size", "0"))) for row in rows), Decimal("0"))
+            if total <= submission.qty and await self._order_matches_submission(
+                order_id, submission, lower, upper,
+            ):
+                execution_candidates.add(order_id)
+        candidates = execution_candidates | active_candidates
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"{len(candidates)} GMO orders match durable submission {submission.id}"
+            )
+        if not candidates:
+            if not executions_covered or not active_covered:
+                raise RuntimeError("GMO history pagination did not cover submission time window")
+            return None, None
+        order_id = next(iter(candidates))
+        rows = grouped.get(order_id, [])
+        if not rows:
+            return order_id, None
+        filled = sum((Decimal(str(row.get("size", "0"))) for row in rows), Decimal("0"))
+        notional = sum((
+            Decimal(str(row.get("size", "0"))) * Decimal(str(row.get("price", "0")))
+            for row in rows
+        ), Decimal("0"))
+        fee = sum((Decimal(str(row.get("fee", "0"))) for row in rows), Decimal("0"))
+        confirmed = max(
+            (str(row.get("timestamp", submission.submitted_at)) for row in rows),
+            default=submission.submitted_at,
+        )
+        return order_id, HedgeExecution(
+            order_id, filled, notional, fee, submission.submitted_at, confirmed,
+        )
+
+    async def _order_matches_submission(
+        self, order_id: str, submission: HedgeSubmission,
+        lower: datetime, upper: datetime,
+    ) -> bool:
+        detail = await self._order_detail(order_id)
+        timestamp = self._exchange_timestamp(detail.get("timestamp"))
+        execution_type = str(detail.get("executionType", "")).upper()
+        time_in_force = str(detail.get("timeInForce", "")).upper()
+        raw_symbol = str(detail.get("symbol", "")).upper()
+        symbol = raw_symbol if raw_symbol.endswith("_JPY") else f"{raw_symbol}_JPY"
+        return (
+            timestamp is not None and lower <= timestamp <= upper
+            and symbol == submission.symbol
+            and str(detail.get("side", "")).upper() == submission.side
+            and Decimal(str(detail.get("size", "0"))) == submission.qty
+            and (
+                submission.execution_type == "FAK" and execution_type == "MARKET"
+                or submission.execution_type == "SOK" and time_in_force == "SOK"
+            )
+        )
+
+    async def _paged_recovery_rows(
+        self, request: Callable[[int], Awaitable[dict]], lower: datetime,
+    ) -> tuple[list[dict], bool]:
+        rows: list[dict] = []
+        covered = False
+        for page in range(1, 11):
+            payload = await self.limiter.submit(
+                EndpointGroup.QUERY, Priority.CRITICAL,
+                lambda page=page: request(page),
+            )
+            batch = self._rows(payload)
+            rows.extend(batch)
+            timestamps = [
+                timestamp for timestamp in (
+                    self._exchange_timestamp(row.get("timestamp")) for row in batch
+                ) if timestamp is not None
+            ]
+            if len(batch) < 100 or timestamps and min(timestamps) <= lower:
+                covered = True
+                break
+        return rows, covered
+
+    @staticmethod
+    def _exchange_timestamp(value) -> datetime | None:
+        if not value:
+            return None
+        try:
+            result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return result if result.tzinfo else result.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
 
     async def _watch_passive(self, order_id: str, expected: Decimal, price: Decimal, *,
                              timeout_sec: float) -> tuple[Decimal, Decimal, str]:

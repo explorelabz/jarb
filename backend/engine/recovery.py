@@ -75,4 +75,10 @@ class RecoveryCoordinator:
         if await self.store.escalated_hedges():
             await self.store.audit("recovery.hedge.escalated", "critical", "manual hedge resolution required")
             return
+        if await self.store.pending_hedge_submissions():
+            await self.store.audit(
+                "recovery.hedge.submission", "critical",
+                "unresolved durable GMO submission blocks recovery completion",
+            )
+            return
         await self.risk.mark_recovery_complete()

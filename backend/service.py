@@ -14,7 +14,7 @@ import httpx
 from .adapters import BitTradeAdapter, GmoAdapter
 from .audit_store import AuditStore
 from .config import Credentials
-from .core import make_quotes, matched_trade, reconcile, validate_config
+from .core import NATIVE_CORE_AVAILABLE, core_runtime, make_quotes, matched_trade, reconcile, validate_config
 from .engine.balance import BalanceCache
 from .engine.alerting import LarkWebhookNotifier
 from .engine.domain import EventType, FillDelta, HedgePreconditionError
@@ -295,9 +295,9 @@ class TradingService:
         finally:
             self.subscribers.discard(queue)
 
-    async def configure(self, patch: dict) -> None:
+    async def configure(self, patch: dict, actor: str = "operator") -> None:
         if self.places_real_orders and self._engine_ready and self.risk_gate.armed:
-            await self.disarm("strategy configuration changed", "operator")
+            await self.disarm("strategy configuration changed", actor)
         requested_symbols = patch.pop("symbols", None)
         legacy_symbol = patch.pop("symbol", None)
         fee_overrides_patch = patch.pop("gmoFeeBpsByAsset", None)
@@ -412,8 +412,10 @@ class TradingService:
             self.state.symbolStates = next_states
             self.state.config = next_states[target_symbols[0]].config
             self._sync_primary()
-        await self._record("info", "strategy.updated", f"多币种策略已更新：{', '.join(target_symbols)}",
-                           {**patch, "symbols": target_symbols})
+        await self._record(
+            "info", "strategy.updated", f"多币种策略已更新：{', '.join(target_symbols)}",
+            {**patch, "symbols": target_symbols}, actor=actor,
+        )
         if self._engine_ready:
             await self._persist_inventory()
             await self.state_store.set_state("gmo.fee_overrides", self._gmo_fee_overrides)
@@ -468,7 +470,7 @@ class TradingService:
         self._symbol_cache_at = time.monotonic()
         return common
 
-    async def configure_connection(self, update: ConnectionUpdate) -> None:
+    async def configure_connection(self, update: ConnectionUpdate, actor: str = "operator") -> None:
         if update.mode != self.state.mode:
             raise ValueError("Paper/Live 使用不同交易所边界，切换模式后请重启服务")
         if update.mode == "live" and not update.confirmOnline:
@@ -514,10 +516,14 @@ class TradingService:
                     cancel_existing=True,
                     reconcile_fills=self._reconcile_unsettled if self.rest_fill_source else None,
                 ).run()
-            await self._record("warning", "connection.live", "已连接真实账户，当前保持 DISARMED")
+            await self._record(
+                "warning", "connection.live", "已连接真实账户，当前保持 DISARMED", actor=actor,
+            )
         else:
             self.state.connection = self._connection_state("paper")
-            await self._record("info", "connection.paper", "Paper 交易所边界运行中")
+            await self._record(
+                "info", "connection.paper", "Paper 交易所边界运行中", actor=actor,
+            )
         self._publish()
 
     def connection_summary(self) -> dict:
@@ -550,13 +556,18 @@ class TradingService:
             "matching": matching,
         }
 
-    async def configure_paper_scenarios(self, update: PaperScenarioUpdate) -> dict:
+    async def configure_paper_scenarios(
+        self, update: PaperScenarioUpdate, actor: str = "operator",
+    ) -> dict:
         if self.paper_broker is None:
             raise ValueError("坏情况注入只在 Paper 模式可用")
         result = self.paper_broker.configure(update.model_dump(exclude_none=True))
         if self._engine_ready:
             await self.state_store.set_state("paper.scenarios", result.model_dump())
-        await self._record("warning", "paper.scenarios.updated", "Paper 撮合坏情况开关已更新", result.model_dump())
+        await self._record(
+            "warning", "paper.scenarios.updated", "Paper 撮合坏情况开关已更新",
+            result.model_dump(), actor=actor,
+        )
         return self.paper_scenario_summary()
 
     async def control(self, action: str, actor: str = "operator") -> None:
@@ -598,7 +609,7 @@ class TradingService:
     def export_reconciliation(self) -> dict:
         primary = self.state.symbolStates[self.state.activeSymbols[0]]
         day = datetime.now(timezone.utc).date().isoformat()
-        return {"generatedAt": utc_now(), "scope": "daily", "core": "Rust/PyO3",
+        return {"generatedAt": utc_now(), "scope": "daily", "core": core_runtime(),
                 "formula": "Σ(client signed quantity) + Σ(hedge signed quantity) = delta",
                 "result": primary.reconciliation.model_dump(), "pnl": primary.pnl.model_dump(),
                 "symbols": {symbol: {
@@ -850,13 +861,18 @@ class TradingService:
         self.state.pnl = runtime.pnl
         self.state.trades = runtime.trades
 
-    async def _record(self, level: str, event_type: str, message: str, metadata: dict | None = None) -> None:
+    async def _record(
+        self, level: str, event_type: str, message: str,
+        metadata: dict | None = None, *, actor: str | None = None,
+    ) -> None:
         event = AuditEvent(id=str(uuid4()), timestamp=utc_now(), level=level, type=event_type, message=message, metadata=metadata)
         self.state.events.insert(0, event)
         self.state.events = self.state.events[:80]
         await self.audit_store.append(event)
         if self._engine_ready:
-            await self.state_store.audit(event_type, level, message, metadata=metadata)
+            await self.state_store.audit(
+                event_type, level, message, actor=actor, metadata=metadata,
+            )
 
     def risk_status(self) -> dict:
         return {
@@ -883,9 +899,11 @@ class TradingService:
             "armTtlSec": limits.arm_ttl_sec,
         }
 
-    async def configure_risk_limits(self, update: RiskLimitsUpdate) -> dict:
+    async def configure_risk_limits(
+        self, update: RiskLimitsUpdate, actor: str = "operator",
+    ) -> dict:
         if self.state.mode == "live" and self.risk_gate.armed:
-            await self.disarm("risk limits changed", "operator")
+            await self.disarm("risk limits changed", actor)
         values = update.model_dump(exclude_none=True)
         # Lease duration is dictated by the mode: one hour for live trading and
         # 24 hours for Paper runs. Keep accepting the UI's field for compatibility.
@@ -913,7 +931,9 @@ class TradingService:
         )
         if self._engine_ready:
             await self.state_store.set_state("risk.limits", asdict(self.risk_gate.limits))
-        await self._record("warning", "risk.limits.updated", "实盘风控限额已更新", values)
+        await self._record(
+            "warning", "risk.limits.updated", "实盘风控限额已更新", values, actor=actor,
+        )
         self._publish()
         return self.risk_limits_summary()
 
@@ -964,6 +984,17 @@ class TradingService:
         self._sync_primary()
 
     async def arm(self, phrase: str, actor: str) -> dict:
+        if self.places_real_orders and not NATIVE_CORE_AVAILABLE:
+            await self.state_store.audit(
+                "risk.arm.denied", "critical",
+                "live Arm requires the Rust/PyO3 hedge core", actor=actor,
+            )
+            raise ValueError("Live 模式缺少 Rust/PyO3 核心，禁止 Arm")
+        pending_submissions = await self.state_store.pending_hedge_submissions()
+        if pending_submissions:
+            raise ValueError(
+                f"仍有 {len(pending_submissions)} 笔 GMO 提交未完成孤儿单对账，禁止 Arm"
+            )
         if not self._bittrade_configured() or not self.gmo.api_key or not self.gmo.secret_key:
             raise ValueError("BitTrade 与 GMO 私有 API 凭据必须全部配置")
         stale = [
@@ -1717,7 +1748,8 @@ class TradingService:
         await self._recompute_inventory_status(notify=False)
 
     async def configure_inventory(self, bittrade: dict[str, float], gmo: dict[str, float], *,
-                                  webhook_url: str | None = None, clear_webhook: bool = False) -> dict:
+                                  webhook_url: str | None = None, clear_webhook: bool = False,
+                                  actor: str = "operator") -> dict:
         normalized: dict[str, dict[str, Decimal]] = {}
         for venue, values in (("bittrade", bittrade), ("gmo", gmo)):
             assets: dict[str, Decimal] = {}
@@ -1731,7 +1763,7 @@ class TradingService:
                 assets[code] = amount
             normalized[venue] = assets
         if self.state.mode == "live" and self.risk_gate.armed:
-            await self.disarm("inventory configuration changed", "operator")
+            await self.disarm("inventory configuration changed", actor)
         self.inventory_allocations = normalized
         self.balance_cache.configure_allocations(normalized)
         if self.paper_broker is not None:
@@ -1745,7 +1777,9 @@ class TradingService:
             self.notifier.configure(webhook_url)
         await self._persist_inventory()
         await self._recompute_inventory_status(notify=True)
-        await self._record("warning", "inventory.updated", "双交易所底仓配置已更新")
+        await self._record(
+            "warning", "inventory.updated", "双交易所底仓配置已更新", actor=actor,
+        )
         self._publish()
         return self.inventory_summary()
 

@@ -76,8 +76,7 @@ class GmoPublicWS:
                 "command": "subscribe", "channel": "orderbooks", "symbol": base,
             }, separators=(",", ":")))
             await asyncio.sleep(1.1)  # GMO ERR-5003: subscribe/unsubscribe is limited to 1 req/s/IP
-        if self.on_trade is not None:
-            for base in self.bases:
+            if self.on_trade is not None:
                 await ws.send(json.dumps({
                     "command": "subscribe", "channel": "trades", "symbol": base,
                     "option": "TAKER_ONLY",
