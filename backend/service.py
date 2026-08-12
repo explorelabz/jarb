@@ -182,6 +182,7 @@ class TradingService:
         self._last_live_risk_snapshot = RiskSnapshot()
         self._paper_risk_observations = 0
         self._paper_risk_would_reject = 0
+        self._paper_risk_reasons: dict[str, int] = {}
         self._paper_risk_current_reason: str | None = None
         self._projection_symbols: set[str] = set()
         self._projection_task: asyncio.Task | None = None
@@ -532,6 +533,7 @@ class TradingService:
         matching["risk"] = {
             "observations": self._paper_risk_observations,
             "wouldReject": self._paper_risk_would_reject,
+            "reasons": dict(self._paper_risk_reasons),
             "currentReason": self._paper_risk_current_reason,
             "orders": self.execution_gateway.paper_risk_stats(),
         }
@@ -1215,6 +1217,9 @@ class TradingService:
             observed_reason = reason if not allowed else None
             if observed_reason is not None:
                 self._paper_risk_would_reject += 1
+                self._paper_risk_reasons[observed_reason] = (
+                    self._paper_risk_reasons.get(observed_reason, 0) + 1
+                )
             if observed_reason != self._paper_risk_current_reason:
                 previous = self._paper_risk_current_reason
                 self._paper_risk_current_reason = observed_reason

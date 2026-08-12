@@ -577,6 +577,7 @@ class FakeGmo:
             Decimal(str(row.get("ahead_better", "0"))),
             Decimal(str(row.get("ahead_same", "0"))),
         )
+        previous_queue = (queue.ahead_better, queue.ahead_same)
         queue.resync(same_side_levels, row["side"], limit_price)
         raw_levels = market.asks if row["side"] == "BUY" else market.bids
         opposite_levels = [
@@ -596,7 +597,7 @@ class FakeGmo:
         row["ahead_better"] = queue.ahead_better
         row["ahead_same"] = queue.ahead_same
         if not touched:
-            return True
+            return previous_queue != (queue.ahead_better, queue.ahead_same)
         available = sum((qty for _, qty in touched), Decimal("0"))
         if through:
             queue.clear()
@@ -617,7 +618,9 @@ class FakeGmo:
                 row["symbol"].removesuffix("_JPY"), row["side"], execution_qty,
                 execution_qty * limit_price,
             )
-        return True
+        return execution_qty > 0 or previous_queue != (
+            queue.ahead_better, queue.ahead_same,
+        )
 
     async def cancel_order(self, order_id: str) -> dict:
         row = self.broker.gmo_orders[str(order_id)]
