@@ -32,7 +32,6 @@ export interface InventoryState {
 
 export interface PaperScenarios {
   gmoPartialFak: boolean
-  gmoPostOnlyFillRatio: number
   gmoPostOnlyFillDelayMs: number
   delayedExecutions: boolean
   postOnlyReject: boolean

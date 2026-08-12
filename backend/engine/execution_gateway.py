@@ -9,6 +9,7 @@ import httpx
 
 from ..adapters import DecimalQuote, ExchangeAPIError
 from .domain import OrderState
+from .paper_matcher import DepthUnavailableError
 from .rate_limit import EndpointGroup, Priority, PriorityRateLimiter
 from .risk import RiskGate, RiskSnapshot
 from .state_store import StateStore
@@ -45,6 +46,10 @@ class ExecutionGateway:
         self._replace_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._fill_reconciler: Callable[[dict], Awaitable[None]] | None = None
         self.paper_engine = paper_engine
+        self.paper_risk_evaluations = 0
+        self.paper_risk_would_reject = 0
+        self.paper_risk_reasons: dict[str, int] = {}
+        self.paper_risk_last_reason: str | None = None
 
     def set_fill_reconciler(self, callback: Callable[[dict], Awaitable[None]] | None) -> None:
         self._fill_reconciler = callback
@@ -54,13 +59,27 @@ class ExecutionGateway:
 
     async def place(self, *, symbol: str, side: str, qty: Decimal, price: Decimal,
                     size_step: Decimal, price_tick: Decimal, snapshot: RiskSnapshot) -> dict:
+        allowed, reason = await self.risk.evaluate(RiskSnapshot(
+            **{**snapshot.__dict__, "order_notional_jpy": float(qty * price)},
+        ), enforce=self.paper_engine is None)
         if self.paper_engine is not None:
-            allowed, reason = self.risk.armed, self.risk.last_reason
-        else:
-            allowed, reason = await self.risk.evaluate(RiskSnapshot(
-                **{**snapshot.__dict__, "order_notional_jpy": float(qty * price)},
-            ))
-        if not allowed:
+            self.paper_risk_evaluations += 1
+            self.paper_risk_last_reason = reason
+            if not allowed:
+                normalized_reason = reason or "unknown"
+                self.paper_risk_would_reject += 1
+                self.paper_risk_reasons[normalized_reason] = (
+                    self.paper_risk_reasons.get(normalized_reason, 0) + 1
+                )
+                await self.store.audit(
+                    "risk.paper.would_reject", "warning",
+                    f"Paper order would be rejected by RiskGate: {normalized_reason}",
+                    metadata={
+                        "symbol": symbol, "side": side, "qty": str(qty),
+                        "price": str(price), "orderNotionalJpy": str(qty * price),
+                    },
+                )
+        elif not allowed:
             raise RuntimeError(f"order rejected by RiskGate: {reason}")
         sequence = await self.store.next_sequence(f"order-seq:{symbol}:{side}")
         client_order_id = f"{symbol.replace('_', '')}-{side}-{sequence}"
@@ -72,6 +91,11 @@ class ExecutionGateway:
             exchange_order_id = f"PAPER-{client_order_id}"
             try:
                 await self.paper_engine.on_place(client_order_id, symbol, side, price, qty)
+            except DepthUnavailableError:
+                await self.paper_engine.on_cancel(client_order_id)
+                return await self.store.transition_order(
+                    client_order_id, OrderState.FAILED, error="depth_unavailable",
+                )
             except Exception as exc:
                 await self.paper_engine.on_cancel(client_order_id)
                 return await self.store.transition_order(
@@ -118,6 +142,14 @@ class ExecutionGateway:
         return await self.store.transition_order(
             client_order_id, OrderState.OPEN, exchange_order_id=exchange_order_id,
         )
+
+    def paper_risk_stats(self) -> dict[str, Any]:
+        return {
+            "evaluations": self.paper_risk_evaluations,
+            "wouldReject": self.paper_risk_would_reject,
+            "reasons": dict(self.paper_risk_reasons),
+            "lastReason": self.paper_risk_last_reason,
+        }
 
     async def replace(self, current: dict | None, **new_order: Any) -> dict:
         key = (new_order["symbol"], new_order["side"])

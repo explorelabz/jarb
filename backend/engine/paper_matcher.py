@@ -59,6 +59,10 @@ class DepthProvider(Protocol):
     def levels(self, symbol: str, side: str) -> list[tuple[Decimal, Decimal]]: ...
 
 
+class DepthUnavailableError(RuntimeError):
+    """A paper order cannot be queued because its public depth is unavailable."""
+
+
 class BitTradeDepthFeed:
     """Fresh full-depth snapshots from BitTrade's gzip public WebSocket."""
 
@@ -88,10 +92,10 @@ class BitTradeDepthFeed:
     def levels(self, symbol: str, side: str) -> list[tuple[Decimal, Decimal]]:
         snapshot = self.snapshots.get(symbol.upper())
         if snapshot is None:
-            raise RuntimeError(f"BitTrade {symbol} WebSocket 深度尚未就绪")
+            raise DepthUnavailableError(f"BitTrade {symbol} WebSocket 深度尚未就绪")
         age = time.monotonic() - snapshot.received_at
         if age > self.stale_after_sec:
-            raise RuntimeError(f"BitTrade {symbol} WebSocket 深度已过期（{age:.1f}s）")
+            raise DepthUnavailableError(f"BitTrade {symbol} WebSocket 深度已过期（{age:.1f}s）")
         if side == "BUY":
             return list(snapshot.bids)
         if side == "SELL":
@@ -244,11 +248,29 @@ class PaperOrder:
     side: str
     price: Decimal
     qty: Decimal
-    ahead_qty: Decimal
+    ahead_better: Decimal
+    ahead_same: Decimal
     filled: Decimal = Decimal("0")
     seq: int = 0
     active: bool = False
     placed_seq: int = 0
+
+    @property
+    def ahead_qty(self) -> Decimal:
+        return self.ahead_better + self.ahead_same
+
+    def clear_ahead(self) -> None:
+        self.ahead_better = Decimal("0")
+        self.ahead_same = Decimal("0")
+
+    def consume_ahead(self, available: Decimal) -> Decimal:
+        """Consume visible queue with same-price FIFO volume first."""
+        consumed_same = min(self.ahead_same, available)
+        self.ahead_same -= consumed_same
+        available -= consumed_same
+        consumed_better = min(self.ahead_better, available)
+        self.ahead_better -= consumed_better
+        return consumed_same + consumed_better
 
 
 class PaperMatchingEngine:
@@ -257,7 +279,9 @@ class PaperMatchingEngine:
     def __init__(self, fill_tracker: FillTracker, depth_provider: DepthProvider,
                  maker_fee_bps: Callable[[str], Decimal] | None = None, *,
                  initial_stats: dict[str, Any] | None = None,
-                 stats_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None):
+                 stats_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+                 stats_flush_interval_sec: float = 5.0,
+                 stats_flush_fill_count: int = 50):
         self.orders: dict[str, PaperOrder] = {}
         self.fill_tracker = fill_tracker
         self.depth_provider = depth_provider
@@ -272,19 +296,25 @@ class PaperMatchingEngine:
         self.through_qty = Decimal(str(initial_stats.get("throughQty", "0")))
         self.at_level_qty = Decimal(str(initial_stats.get("atLevelQty", "0")))
         self.stats_callback = stats_callback
+        self.stats_flush_interval_sec = stats_flush_interval_sec
+        self.stats_flush_fill_count = stats_flush_fill_count
+        self._stats_dirty_fills = 0
+        self._last_stats_flush = time.monotonic()
+        self._stats_flush_task: asyncio.Task | None = None
         self.public_trades_seen = 0
         self.last_trade_ts_ms = 0
 
     async def on_place(self, client_order_id: str, symbol: str, side: str,
                        price: Decimal, qty: Decimal) -> PaperOrder:
         levels = self.depth_provider.levels(symbol, side)
-        ahead = sum((size for level_price, size in levels if (
-            level_price <= price if side == "SELL" else level_price >= price
+        ahead_better = sum((size for level_price, size in levels if (
+            level_price < price if side == "SELL" else level_price > price
         )), Decimal("0"))
+        ahead_same = sum((size for level_price, size in levels if level_price == price), Decimal("0"))
         async with self._lock:
             self._placed_seq += 1
             order = PaperOrder(
-                client_order_id, symbol, side, price, qty, ahead,
+                client_order_id, symbol, side, price, qty, ahead_better, ahead_same,
                 placed_seq=self._placed_seq,
             )
             self.orders[client_order_id] = order
@@ -306,6 +336,7 @@ class PaperMatchingEngine:
 
     async def on_trade(self, trade: PublicTrade) -> None:
         scoped_trade_id = f"{trade.symbol}:{trade.trade_id}"
+        stats_to_persist: dict[str, Any] | None = None
         async with self._lock:
             if scoped_trade_id in self._seen_trades:
                 return
@@ -318,10 +349,15 @@ class PaperMatchingEngine:
 
             candidates = sorted(
                 (order for order in self.orders.values() if order.active and order.symbol == trade.symbol),
-                key=lambda order: order.placed_seq,
+                key=lambda order: (
+                    order.price if trade.taker_side == "BUY" else -order.price,
+                    order.placed_seq,
+                ),
             )
-            at_level_available = trade.qty
+            available = trade.qty
             for order in candidates:
+                if available <= 0:
+                    break
                 if trade.taker_side == "BUY" and order.side != "SELL":
                     continue
                 if trade.taker_side == "SELL" and order.side != "BUY":
@@ -335,13 +371,13 @@ class PaperMatchingEngine:
                     continue
                 match_kind = "through" if through else "at_level"
                 if through:
-                    exec_qty = remaining
-                else:
-                    consumed = min(order.ahead_qty, at_level_available)
-                    order.ahead_qty -= consumed
-                    at_level_available -= consumed
-                    exec_qty = min(remaining, at_level_available)
-                    at_level_available -= exec_qty
+                    # A print beyond our price proves that the visible queue ahead
+                    # was traversed, but the print quantity still caps our fill.
+                    order.clear_ahead()
+                consumed = order.consume_ahead(available)
+                available -= consumed
+                exec_qty = min(remaining, available)
+                available -= exec_qty
                 if exec_qty <= 0:
                     continue
                 order.filled += exec_qty
@@ -364,10 +400,33 @@ class PaperMatchingEngine:
                 else:
                     self.at_level_fills += 1
                     self.at_level_qty += exec_qty
-                if self.stats_callback is not None:
-                    await self.stats_callback(self.stats())
+                self._stats_dirty_fills += 1
+                if self.stats_callback is not None and self._stats_flush_task is None:
+                    self._stats_flush_task = asyncio.create_task(
+                        self._flush_stats_after_interval(), name="paper-matching-stats-flush",
+                    )
                 if order.filled >= order.qty:
                     self.orders.pop(order.client_order_id, None)
+            now = time.monotonic()
+            if self.stats_callback is not None and self._stats_dirty_fills > 0 and (
+                self._stats_dirty_fills >= self.stats_flush_fill_count
+                or now - self._last_stats_flush >= self.stats_flush_interval_sec
+            ):
+                stats_to_persist = self.stats()
+                self._stats_dirty_fills = 0
+                self._last_stats_flush = now
+        if stats_to_persist is not None and self.stats_callback is not None:
+            await self.stats_callback(stats_to_persist)
+
+    async def _flush_stats_after_interval(self) -> None:
+        try:
+            await asyncio.sleep(self.stats_flush_interval_sec)
+            async with self._lock:
+                dirty = self._stats_dirty_fills > 0
+            if dirty:
+                await self.flush_stats(cancel_timer=False)
+        finally:
+            self._stats_flush_task = None
 
     async def resync_once(self) -> None:
         async with self._lock:
@@ -375,10 +434,14 @@ class PaperMatchingEngine:
                 if not order.active:
                     continue
                 levels = self.depth_provider.levels(order.symbol, order.side)
-                snapshot_ahead = sum((size for price, size in levels if (
+                snapshot_better = sum((size for price, size in levels if (
                     price < order.price if order.side == "SELL" else price > order.price
                 )), Decimal("0"))
-                order.ahead_qty = min(order.ahead_qty, snapshot_ahead)
+                snapshot_same = sum((
+                    size for price, size in levels if price == order.price
+                ), Decimal("0"))
+                order.ahead_better = min(order.ahead_better, snapshot_better)
+                order.ahead_same = min(order.ahead_same, snapshot_same)
 
     async def resync_queue(self, interval_sec: float = 2.0) -> None:
         while True:
@@ -390,6 +453,24 @@ class PaperMatchingEngine:
             except Exception:
                 # A stale/missing depth snapshot must never manufacture queue progress.
                 continue
+
+    async def flush_stats(self, *, cancel_timer: bool = True) -> None:
+        """Persist the latest counters outside the matching lock during shutdown."""
+        if self.stats_callback is None:
+            return
+        task = self._stats_flush_task
+        if cancel_timer and task is not None and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._stats_flush_task = None
+        async with self._lock:
+            snapshot = self.stats()
+            self._stats_dirty_fills = 0
+            self._last_stats_flush = time.monotonic()
+        await self.stats_callback(snapshot)
 
     def stats(self) -> dict[str, Any]:
         total = self.through_fills + self.at_level_fills

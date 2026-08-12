@@ -230,6 +230,17 @@ def test_default_requote_policy_preserves_queue_and_depth_aware_price_steps_insi
     assert buy == Decimal("99")
 
 
+def test_target_price_never_joins_or_crosses_the_opposite_best():
+    assert target_price(
+        [(Decimal("101"), Decimal("1"))], Decimal("100"), Decimal("0"),
+        Decimal("1"), Decimal("1"), "SELL", opposite_best=Decimal("100"),
+    ) is None
+    assert target_price(
+        [(Decimal("99"), Decimal("1"))], Decimal("100"), Decimal("0"),
+        Decimal("1"), Decimal("1"), "BUY", opposite_best=Decimal("100"),
+    ) is None
+
+
 class FakeMakerVenue:
     def __init__(self):
         self.state = "submitted"

@@ -49,6 +49,7 @@ LEGACY_RANDOM_MATCH_FIELDS = {
     "autoMatch", "partialFills", "dustFills", "duplicateEvents", "outOfOrderEvents",
     "cancelAlreadyFilled", "cancelRaceFill", "autoMatchProbability", "dustProbability",
     "duplicateProbability", "outOfOrderProbability", "cancelRaceProbability",
+    "gmoPostOnlyFillRatio",
 }
 
 
@@ -179,6 +180,9 @@ class TradingService:
         self._engine_ready = False
         self._working_quotes: dict[tuple[str, str], WorkingQuote] = {}
         self._last_live_risk_snapshot = RiskSnapshot()
+        self._paper_risk_observations = 0
+        self._paper_risk_would_reject = 0
+        self._paper_risk_current_reason: str | None = None
         self._projection_symbols: set[str] = set()
         self._projection_task: asyncio.Task | None = None
         instrument = InstrumentRules(symbol=config.symbol, baseAsset=base_asset, minOrderSize=.0001,
@@ -525,6 +529,12 @@ class TradingService:
         }
         matching["publicDepth"] = self.bittrade_depth_feed.status() \
             if self.bittrade_depth_feed is not None and hasattr(self.bittrade_depth_feed, "status") else {}
+        matching["risk"] = {
+            "observations": self._paper_risk_observations,
+            "wouldReject": self._paper_risk_would_reject,
+            "currentReason": self._paper_risk_current_reason,
+            "orders": self.execution_gateway.paper_risk_stats(),
+        }
         return {
             **self.paper_broker.scenarios.model_dump(exclude=LEGACY_RANDOM_MATCH_FIELDS),
             "matching": matching,
@@ -1113,6 +1123,8 @@ class TradingService:
                 except asyncio.CancelledError:
                     pass
                 setattr(self, attribute, None)
+        if self.paper_engine is not None:
+            await self.paper_engine.flush_stats()
         self.execution_gateway.set_paper_engine(None)
         self.paper_engine = None
         if self.bittrade_depth_feed is not None:
@@ -1195,12 +1207,32 @@ class TradingService:
             hedge_p95_ms=max(self.state.metrics.hedgeP95Ms, hedge_p95),
         )
         self._last_live_risk_snapshot = snapshot
-        # Paper keeps its Arm lease across transient market gaps. Quote placement
-        # below is independently suppressed until both public books are fresh.
-        gate_snapshot = snapshot if self.places_real_orders else RiskSnapshot(
-            market_age_ms=0, stale_market_ms=1,
+        allowed, reason = await self.risk_gate.evaluate(
+            snapshot, enforce=self.places_real_orders,
         )
-        allowed, reason = await self.risk_gate.evaluate(gate_snapshot)
+        if not self.places_real_orders:
+            self._paper_risk_observations += 1
+            observed_reason = reason if not allowed else None
+            if observed_reason is not None:
+                self._paper_risk_would_reject += 1
+            if observed_reason != self._paper_risk_current_reason:
+                previous = self._paper_risk_current_reason
+                self._paper_risk_current_reason = observed_reason
+                if observed_reason is not None:
+                    await self._record(
+                        "warning", "risk.paper.would_reject",
+                        f"Paper RiskGate 本轮若为实盘将拒绝：{observed_reason}",
+                    )
+                elif previous is not None:
+                    await self._record(
+                        "info", "risk.paper.recovered",
+                        f"Paper RiskGate 观测恢复：{previous}",
+                    )
+            # Paper deliberately observes all live limits without letting them
+            # stop data collection or cancel simulated orders.
+            if self.risk_gate.killed:
+                self.state.killSwitch = True
+            return
         if not allowed and reason == "market data stale":
             self.state.running = False
             for runtime in self.state.symbolStates.values():
@@ -1333,6 +1365,7 @@ class TradingService:
                     book_levels, gmo_hedge_price, required_edge,
                     Decimal(str(runtime.config.queueBudget)),
                     Decimal(str(runtime.instrument.priceTick)), quote.side,
+                    opposite_best=bittrade_best_bid if quote.side == "SELL" else bittrade_best_ask,
                 )
                 current = open_by_key.get(key)
                 if selected_price is None:
@@ -1415,7 +1448,7 @@ class TradingService:
                     self._working_quotes.pop(key, None)
                     open_by_key.pop(key, None)
                     continue
-                elif result.get("last_error") == "post_only_reject":
+                elif result.get("last_error") in ("post_only_reject", "depth_unavailable"):
                     self._working_quotes.pop(key, None)
                     open_by_key.pop(key, None)
                     continue

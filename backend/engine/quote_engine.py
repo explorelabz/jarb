@@ -39,7 +39,7 @@ class QuoteEngine:
 
 def target_price(levels: list[tuple[Decimal, Decimal]], gmo_hedge_price: Decimal,
                  edge_bps: Decimal, queue_budget: Decimal, tick: Decimal,
-                 side: str) -> Decimal | None:
+                 side: str, *, opposite_best: Decimal | None = None) -> Decimal | None:
     """Join one tick ahead of the first profitable BitTrade level within queue budget."""
     if not levels or gmo_hedge_price <= 0 or tick <= 0:
         return None
@@ -50,7 +50,8 @@ def target_price(levels: list[tuple[Decimal, Decimal]], gmo_hedge_price: Decimal
         boundary = (boundary / tick).to_integral_value(rounding=ROUND_UP) * tick
         for price, size in levels:  # asks, ascending
             if price >= boundary and ahead <= queue_budget:
-                return max(boundary, price - tick)
+                result = max(boundary, price - tick)
+                return result if opposite_best is None or result > opposite_best else None
             ahead += max(Decimal("0"), size)
         return None
     if side == "BUY":
@@ -58,7 +59,8 @@ def target_price(levels: list[tuple[Decimal, Decimal]], gmo_hedge_price: Decimal
         boundary = (boundary / tick).to_integral_value(rounding=ROUND_DOWN) * tick
         for price, size in levels:  # bids, descending
             if price <= boundary and ahead <= queue_budget:
-                return min(boundary, price + tick)
+                result = min(boundary, price + tick)
+                return result if opposite_best is None or result < opposite_best else None
             ahead += max(Decimal("0"), size)
         return None
     raise ValueError("side must be BUY or SELL")

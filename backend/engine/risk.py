@@ -152,7 +152,7 @@ class RiskGate:
             self.last_reason = "kill reset; recovery and arm required"
             await self._persist("kill reset", actor)
 
-    async def evaluate(self, snapshot: RiskSnapshot) -> tuple[bool, str | None]:
+    async def evaluate(self, snapshot: RiskSnapshot, *, enforce: bool = True) -> tuple[bool, str | None]:
         if self.armed_until > 0 and time.time() >= self.armed_until:
             await self.disarm("arm expired")
         if self.kill_sentinel.exists() and not self.killed:
@@ -168,7 +168,7 @@ class RiskGate:
         )
         for triggered, reason in checks:
             if triggered:
-                if self.armed:
+                if enforce and self.armed:
                     await self.disarm(reason)
                 return False, reason
         if not self.armed:

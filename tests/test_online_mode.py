@@ -258,6 +258,9 @@ async def test_paper_records_hedge_latency_without_disarming(tmp_path):
         assert service.risk_gate.armed
         assert service.state.running
         assert service._last_live_risk_snapshot.hedge_p95_ms == 99_999
+        observed = service.paper_scenario_summary()["matching"]["risk"]
+        assert observed["wouldReject"] == 1
+        assert observed["currentReason"] == "hedge latency limit exceeded"
 
         service.market_feed.latest["BTC_JPY"] = service.state.market.model_copy(
             update={"timestamp": "2020-01-01T00:00:00Z"},

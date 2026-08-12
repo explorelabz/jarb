@@ -306,7 +306,6 @@ function Settings({ state, risk, onClose, onSaved }: { state: SystemState; risk:
         </div>
         <div className="form-pair">
           <label><span>GMO 部分成交比例</span><input className="secret-input" type="number" min="0.01" max="1" step="0.05" value={paperScenarios.gmoFillRatio} onChange={e => setPaperScenarios(v => v ? ({ ...v, gmoFillRatio: Number(e.target.value) }) : v)} /></label>
-          <label><span>GMO SOK 被动成交比例</span><input className="secret-input" type="number" min="0" max="1" step="0.05" value={paperScenarios.gmoPostOnlyFillRatio} onChange={e => setPaperScenarios(v => v ? ({ ...v, gmoPostOnlyFillRatio: Number(e.target.value) }) : v)} /></label>
           <label><span>GMO SOK 模拟成交延迟 ms</span><input className="secret-input" type="number" min="0" max="10000" value={paperScenarios.gmoPostOnlyFillDelayMs} onChange={e => setPaperScenarios(v => v ? ({ ...v, gmoPostOnlyFillDelayMs: Number(e.target.value) }) : v)} /></label>
           <label><span>executions 最短延迟 ms</span><input className="secret-input" type="number" min="0" max="10000" value={paperScenarios.executionDelayMinMs} onChange={e => setPaperScenarios(v => v ? ({ ...v, executionDelayMinMs: Number(e.target.value) }) : v)} /></label>
           <label><span>executions 最长延迟 ms</span><input className="secret-input" type="number" min="0" max="10000" value={paperScenarios.executionDelayMaxMs} onChange={e => setPaperScenarios(v => v ? ({ ...v, executionDelayMaxMs: Number(e.target.value) }) : v)} /></label>
