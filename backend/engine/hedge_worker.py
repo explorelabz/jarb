@@ -840,11 +840,21 @@ class GmoHedgeExecutor:
             await asyncio.sleep(self.orphan_recovery_grace_sec - max(0.0, age_sec))
         lower = submitted - timedelta(seconds=15)
         upper = submitted + timedelta(minutes=5)
-        execution_rows, executions_covered = await self._paged_recovery_rows(
-            lambda page: self.adapter.latest_executions(
-                submission.symbol, page=page, count=100,
-            ), lower,
-        )
+        if hasattr(self.adapter, "executions_by_symbol_window"):
+            payload = await self.limiter.submit(
+                EndpointGroup.QUERY, Priority.CRITICAL,
+                lambda: self.adapter.executions_by_symbol_window(
+                    submission.symbol, lower, upper, count=100, max_pages=10,
+                ),
+            )
+            execution_rows = self._rows(payload)
+            executions_covered = bool(payload.get("windowCovered", False))
+        else:
+            execution_rows, executions_covered = await self._paged_recovery_rows(
+                lambda page: self.adapter.latest_executions(
+                    submission.symbol, page=page, count=100,
+                ), lower,
+            )
         active_rows, active_covered = await self._paged_recovery_rows(
             lambda page: self.adapter.active_orders(
                 submission.symbol, page=page, count=100,

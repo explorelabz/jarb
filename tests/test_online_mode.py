@@ -149,16 +149,72 @@ def paper_market_adapters() -> dict:
 
 @pytest.mark.asyncio
 async def test_live_arm_refuses_python_fallback_core(tmp_path, monkeypatch):
-    monkeypatch.setattr("backend.service.NATIVE_CORE_AVAILABLE", False)
+    monkeypatch.setattr("backend.core.NATIVE_CORE_AVAILABLE", False)
     service = TradingService(
         StrategyConfig(), mode="live", gmo=FakeGmo(), bittrade=FakeBittrade(),
         db_path=tmp_path / "state.db",
     )
     await service.state_store.initialize()
-    with pytest.raises(ValueError, match="Rust/PyO3"):
+    with pytest.raises(ValueError, match="Rust 核心未安装"):
         await service.arm("irrelevant", "alice")
     await service.state_store.close()
     await service.notifier.close()
+
+
+@pytest.mark.asyncio
+async def test_zero_quote_and_zero_fill_metrics_alert_once_per_incident(tmp_path):
+    class CaptureNotifier:
+        def __init__(self):
+            self.messages: list[tuple[str, str]] = []
+
+        async def send_once(self, key: str, message: str) -> bool:
+            self.messages.append((key, message))
+            return True
+
+    service = TradingService(
+        StrategyConfig(queueBudgetJpy=0), mode="paper", gmo=FakeGmo(), bittrade=FakeBittrade(),
+        db_path=tmp_path / "activity.db", activity_alert_sec=0,
+        bittrade_depth_factory=FakeDepthFeed,
+    )
+    original_notifier = service.notifier
+    notifier = CaptureNotifier()
+    service.notifier = notifier
+    await service.state_store.initialize()
+    service.risk_gate.kill_sentinel = tmp_path / "KILL"
+    await service.risk_gate.restore()
+    await service.risk_gate.mark_recovery_complete()
+    await service.risk_gate.arm("ARM JARB PAPER", "paper-engine")
+    for venue in ("bittrade", "gmo"):
+        await service.balance_cache.update(venue, "JPY", Decimal("1000000"))
+        await service.balance_cache.update(venue, "BTC", Decimal("1"))
+    service.bittrade_depth_feed = FakeDepthFeed(["BTC_JPY"])
+    market = await service.gmo.ticker("BTC")
+    service.state.symbolStates["BTC_JPY"].market = market
+    await service.market_feed.update(market, transport="ws")
+
+    await service._run_live_quotes()
+    assert service.state.metrics.quoteSelectionNoneCount == 2
+    await service._check_activity_alerts()
+    await service._check_activity_alerts()
+    assert [key for key, _ in notifier.messages] == ["activity:zero-quotes"]
+
+    await service.state_store.create_order(
+        "BTCJPY-BUY-ACTIVITY", "BTC_JPY", "BUY", Decimal("0.01"), Decimal("100"),
+    )
+    await service.state_store.transition_order("BTCJPY-BUY-ACTIVITY", OrderState.PLACING)
+    await service.state_store.transition_order(
+        "BTCJPY-BUY-ACTIVITY", OrderState.OPEN, exchange_order_id="BT-ACTIVITY",
+    )
+    await service._check_activity_alerts()
+    await service._check_activity_alerts()
+    assert [key for key, _ in notifier.messages] == [
+        "activity:zero-quotes", "activity:zero-fills",
+    ]
+    assert service.state.metrics.noQuoteDurationSec == 0
+    assert service.state.metrics.lastQuoteAt is not None
+
+    await service.state_store.close()
+    await original_notifier.close()
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from .engine.risk import RiskLimits
+from .engine.risk import ARM_TTL_BY_MODE, RiskLimits
 from .models import StrategyConfig, gmo_maker_bps, gmo_taker_bps
 
 
@@ -39,7 +39,7 @@ gmo_maker_fee_overrides = fee_overrides(os.getenv("GMO_MAKER_FEE_BPS_OVERRIDES",
 
 strategy_config = StrategyConfig(
     symbol=configured_symbol,
-    spreadBps=number("SPREAD_BPS", 25),
+    spreadBps=number("SPREAD_BPS", 12),
     bittradeMakerFeeBps=number("BITTRADE_MAKER_FEE_BPS", 0),
     gmoFeeBps=gmo_taker_bps(configured_symbol.removesuffix("_JPY"), gmo_fee_overrides),
     gmoMakerFeeBps=gmo_maker_bps(configured_symbol.removesuffix("_JPY"), gmo_maker_fee_overrides),
@@ -47,7 +47,7 @@ strategy_config = StrategyConfig(
     gmoPostOnlyTimeoutMs=int(number("GMO_POST_ONLY_TIMEOUT_MS", 800)),
     maxHedgeSlippageBps=number("MAX_HEDGE_SLIPPAGE_BPS", 3),
     expectedSlippageBps=number("EXPECTED_SLIPPAGE_BPS", 3),
-    queueBudget=number("BITTRADE_QUEUE_BUDGET", .05),
+    queueBudgetJpy=number("BITTRADE_QUEUE_BUDGET_JPY", 1_500_000),
     maxQuoteSize=number("MAX_QUOTE_SIZE", 0.05),
     deltaLimit=number("DELTA_LIMIT", 0.005),
     maxHedgeLatencyMs=int(number("MAX_HEDGE_LATENCY_MS", 2500)),
@@ -57,6 +57,7 @@ strategy_config = StrategyConfig(
 
 requested_mode = "live" if os.getenv("TRADING_MODE", "paper").strip().lower() in {"online", "live"} else "paper"
 require_dual_arm_approval = boolean("REQUIRE_DUAL_ARM_APPROVAL", False)
+zero_activity_alert_minutes = number("ZERO_ACTIVITY_ALERT_MINUTES", 10)
 risk_limits = RiskLimits(
     max_single_order_jpy=number("MAX_SINGLE_ORDER_JPY", 250_000),
     max_daily_volume_jpy=number("MAX_DAILY_VOLUME_JPY", 5_000_000),
@@ -64,7 +65,7 @@ risk_limits = RiskLimits(
     max_abs_delta=number("MAX_ABS_DELTA", strategy_config.deltaLimit),
     max_hedge_failures=int(number("MAX_HEDGE_FAILURES", 3)),
     max_hedge_p95_ms=int(number("MAX_HEDGE_P95_MS", strategy_config.maxHedgeLatencyMs)),
-    arm_ttl_sec=int(number("ARM_TTL_SEC", 3_600)),
+    arm_ttl_sec=ARM_TTL_BY_MODE[requested_mode],
 )
 
 

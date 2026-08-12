@@ -14,7 +14,7 @@ from .auth import authenticate_request, current_operator, sensitive_approvals
 
 from .config import (
     credentials, gmo_fee_overrides, gmo_maker_fee_overrides, requested_mode,
-    require_dual_arm_approval, risk_limits,
+    require_dual_arm_approval, risk_limits, zero_activity_alert_minutes,
     strategy_config,
 )
 from .core import core_runtime
@@ -29,6 +29,7 @@ service = TradingService(
     gmo_fee_overrides=gmo_fee_overrides,
     gmo_maker_fee_overrides=gmo_maker_fee_overrides,
     require_dual_arm_approval=require_dual_arm_approval,
+    activity_alert_sec=max(0, zero_activity_alert_minutes * 60),
 )
 
 

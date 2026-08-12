@@ -403,7 +403,7 @@ function Settings({ state, risk, onClose, onSaved }: { state: SystemState; risk:
         <label><span>BitTrade Maker 费率</span><div className="input-with-unit"><input type="number" step="0.01" value={form.bittradeMakerFeeBps} onChange={e => set('bittradeMakerFeeBps', e.target.value)} /><i>bps</i></div></label>
         <label><span>预期滑点</span><div className="input-with-unit"><input type="number" step="0.1" value={form.expectedSlippageBps} onChange={e => set('expectedSlippageBps', e.target.value)} /><i>bps</i></div></label>
         <label><span>累计深度滑点范围</span><div className="input-with-unit"><input type="number" min="0" step="0.1" value={form.maxHedgeSlippageBps} onChange={e => set('maxHedgeSlippageBps', e.target.value)} /><i>bps</i></div></label>
-        <label><span>BitTrade 排队预算</span><div className="input-with-unit"><input type="number" min="0" step="0.001" value={form.queueBudget} onChange={e => set('queueBudget', e.target.value)} /><i>币</i></div></label>
+        <label><span>BitTrade 排队预算</span><div className="input-with-unit"><input type="number" min="0" step="10000" value={form.queueBudgetJpy} onChange={e => set('queueBudgetJpy', e.target.value)} /><i>JPY</i></div></label>
       </div>
       <div className="settings-section fee-section">
         <div className="settings-title"><div><b>GMO Taker 费率（每币种）</b><small>可按账户实际费率覆盖；未设置时采用公开费率表</small></div></div>

@@ -41,11 +41,12 @@ BitTrade 私有 WS → FillTracker → HedgeWorker → GMO SOK(Post-Only) → �
 - 对冲延迟按“BitTrade 成交发生 → GMO executions 确认”记录，真实成交滑点写入审计，P95 直接进入自动 Disarm 风控。默认限额为 2500ms；配置不得低于 `gmoPostOnlyTimeoutMs + 1200ms`，避免 800ms 被动等待本身必然触发旧的 1 秒阈值。
 - 按 endpoint 分组的令牌桶和优先队列保证“对冲 / kill / 撤单”优先于挂单和查询；请求获得令牌后并发派发，慢查询不会串行阻塞对冲；429 使用指数退避。
 - 余额每 10 秒与两家交易所对齐，成交后保守地本地扣减；可挂量取策略上限、GMO 对侧深度、BitTrade 余额和 GMO 对冲余额的最小值，再乘 0.7 安全系数。
-- BitTrade 报价从自身多档盘口中寻找满足最低边际且前方累计量不超过 `queueBudget` 的价位，再前进一档进入队列；默认只有价格偏离 8bps、深度变化 60% 或剩余量低于 25% 才重挂。替换仍严格执行先撤单确认、后用新 `client_order_id` 挂单。
+- BitTrade 报价从自身多档盘口中寻找满足最低边际且前方累计金额不超过 `queueBudgetJpy` 的价位，再前进一档进入队列；每个候选价位都以 JPY 预算动态换算数量，因此多币种共享同一金额口径。默认只有价格偏离 8bps、深度变化 60% 或剩余量低于 25% 才重挂。替换仍严格执行先撤单确认、后用新 `client_order_id` 挂单。
 - 报价前读取 BitTrade `/market/depth`；会穿越 BitTrade 当前最优价的方向直接跳过。post-only 拒单只放弃该侧并等待下轮重算，其他下单错误仍会 Disarm。
 - GMO FAK Taker 费率按基础币自动设置：BTC/ETH/XRP/DAI 为 5 bps，其余为 9 bps；SOK Maker 默认分别为 -1 bps / -3 bps。两者都可按币种覆盖，每个币种单独执行混合盈利下限校验。
 - BitTrade 与 GMO 可分别配置 JPY 和每个基础币的策略底仓额度；任一币对的四项底仓或实际余额有一项为 0，整对禁止做市和对冲并撤销该币对挂单。
 - 支持 Lark/飞书 Bot Webhook 底仓报警；相同故障默认 5 分钟内只推送一次，Webhook 仅保存在本机 SQLite，接口只返回脱敏提示。
+- `/api/state.metrics` 暴露候选价为空累计次数、连续零挂单/零成交时长与最近活动时间；超过 `ZERO_ACTIVITY_ALERT_MINUTES` 时 Lark/飞书每次连续故障只报警一次。
 
 ## 环境准备
 
@@ -81,14 +82,15 @@ BITTRADE_ACCESS_KEY=...
 BITTRADE_SECRET_KEY=...
 BITTRADE_ACCOUNT_ID=...
 BITTRADE_MAKER_FEE_BPS=0
-SPREAD_BPS=25
+SPREAD_BPS=12
 EXPECTED_SLIPPAGE_BPS=3
 MAX_HEDGE_SLIPPAGE_BPS=3
 EXPECTED_PASSIVE_FILL_RATIO=0.8
 GMO_POST_ONLY_TIMEOUT_MS=800
 MAX_HEDGE_LATENCY_MS=2500
 MAX_HEDGE_P95_MS=2500
-BITTRADE_QUEUE_BUDGET=0.05
+BITTRADE_QUEUE_BUDGET_JPY=1500000
+ZERO_ACTIVITY_ALERT_MINUTES=10
 STALE_MARKET_MS=3000
 TRADING_MODE=live
 ARM_CONFIRMATION_PHRASE="ARM JARB LIVE"

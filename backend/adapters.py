@@ -109,6 +109,41 @@ class GmoAdapter:
             "symbol": symbol.replace("_JPY", ""), "page": str(page), "count": str(count),
         })
 
+    async def executions_by_symbol_window(
+        self, symbol: str, start_at: datetime, end_at: datetime, *,
+        count: int = 100, max_pages: int = 10,
+    ) -> dict:
+        """Page GMO's symbol history and return executions inside a UTC time window.
+
+        GMO's latestExecutions endpoint has symbol pagination but no server-side
+        timestamp parameters, so recovery must bound and prove coverage locally.
+        """
+        start = start_at if start_at.tzinfo else start_at.replace(tzinfo=timezone.utc)
+        end = end_at if end_at.tzinfo else end_at.replace(tzinfo=timezone.utc)
+        matches: list[dict] = []
+        covered = False
+        pages = 0
+        for page in range(1, max(1, max_pages) + 1):
+            pages = page
+            payload = await self.latest_executions(symbol, page=page, count=count)
+            data = payload.get("data", payload)
+            rows = data.get("list", data.get("executions", [])) if isinstance(data, dict) else data
+            rows = rows if isinstance(rows, list) else []
+            timestamps: list[datetime] = []
+            for row in rows:
+                try:
+                    timestamp = datetime.fromisoformat(str(row.get("timestamp", "")).replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                timestamp = timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=timezone.utc)
+                timestamps.append(timestamp)
+                if start <= timestamp <= end:
+                    matches.append(row)
+            if len(rows) < count or timestamps and min(timestamps) <= start:
+                covered = True
+                break
+        return {"status": 0, "data": {"list": matches}, "windowCovered": covered, "pages": pages}
+
     async def active_orders(self, symbol: str, *, page: int = 1, count: int = 100) -> dict:
         return await self._private("GET", "/v1/activeOrders", query={
             "symbol": symbol.replace("_JPY", ""), "page": str(page), "count": str(count),

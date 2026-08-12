@@ -22,6 +22,11 @@ def core_runtime() -> str:
     return "Rust/PyO3" if NATIVE_CORE_AVAILABLE else "Python/Decimal fallback"
 
 
+def ensure_native_core_for_mode(mode: str) -> None:
+    if mode in {"online", "live"} and not NATIVE_CORE_AVAILABLE:
+        raise ValueError("Rust 核心未安装，禁止实盘 Arm")
+
+
 def validate_config(config: StrategyConfig) -> float:
     minimum_latency_limit = config.gmoPostOnlyTimeoutMs + 1200
     if config.maxHedgeLatencyMs < minimum_latency_limit:

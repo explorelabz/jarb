@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import httpx
@@ -116,3 +117,31 @@ async def test_gmo_order_status_uses_private_orders_endpoint():
         payload = await GmoAdapter("key", "secret", client).order("G-1")
     assert captured == {"path": "/private/v1/orders", "orderId": "G-1"}
     assert payload["data"]["list"][0]["status"] == "EXECUTED"
+
+
+@pytest.mark.asyncio
+async def test_gmo_execution_window_pages_by_symbol_and_proves_coverage():
+    pages: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/private/v1/latestExecutions"
+        assert request.url.params["symbol"] == "BTC"
+        pages.append(request.url.params["page"])
+        if request.url.params["page"] == "1":
+            rows = [
+                {"orderId": str(index), "timestamp": "2026-08-13T00:01:00Z"}
+                for index in range(100)
+            ]
+        else:
+            rows = [{"orderId": "window", "timestamp": "2026-08-12T23:59:59Z"}]
+        return httpx.Response(200, json={"status": 0, "data": {"list": rows}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        payload = await GmoAdapter("key", "secret", client).executions_by_symbol_window(
+            "BTC_JPY",
+            datetime(2026, 8, 13, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 13, 0, 2, tzinfo=timezone.utc),
+        )
+    assert pages == ["1", "2"]
+    assert payload["windowCovered"] is True
+    assert len(payload["data"]["list"]) == 100

@@ -40,7 +40,7 @@ def utc_now() -> str:
 
 class StrategyConfig(BaseModel):
     symbol: str = "BTC_JPY"
-    spreadBps: float = Field(25, gt=0)
+    spreadBps: float = Field(12, gt=0)
     bittradeMakerFeeBps: float = Field(0, ge=-100, le=100)
     gmoFeeBps: float = Field(5, ge=0)
     gmoMakerFeeBps: float = Field(-1, ge=-100, le=100)
@@ -48,7 +48,7 @@ class StrategyConfig(BaseModel):
     gmoPostOnlyTimeoutMs: int = Field(800, ge=100, le=10_000)
     maxHedgeSlippageBps: float = Field(3, ge=0, le=100)
     expectedSlippageBps: float = Field(3, ge=0)
-    queueBudget: float = Field(.05, ge=0)
+    queueBudgetJpy: float = Field(1_500_000, ge=0)
     maxQuoteSize: float = Field(0.05, gt=0)
     deltaLimit: float = Field(0.005, gt=0)
     maxHedgeLatencyMs: int = Field(2500, gt=0)
@@ -166,6 +166,11 @@ class Metrics(BaseModel):
     exceptionCount: int = 0
     uptimeSec: int = 0
     coreCalcP99Us: float = 0
+    quoteSelectionNoneCount: int = 0
+    noQuoteDurationSec: int = 0
+    noFillDurationSec: int = 0
+    lastQuoteAt: str | None = None
+    lastFillAt: str | None = None
 
 
 class ConnectionState(BaseModel):

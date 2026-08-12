@@ -115,7 +115,11 @@ export interface SystemState {
   position: number
   reconciliation: { symbol: string; clientNet: number; hedgeNet: number; delta: number; status: 'matched' | 'exception'; checkedAt: string }
   pnl: { spread: number; clientFees: number; hedgeCosts: number; net: number }
-  metrics: { hedgeP95Ms: number; fillCount: number; exceptionCount: number; uptimeSec: number; coreCalcP99Us: number }
+  metrics: {
+    hedgeP95Ms: number; fillCount: number; exceptionCount: number; uptimeSec: number; coreCalcP99Us: number;
+    quoteSelectionNoneCount: number; noQuoteDurationSec: number; noFillDurationSec: number;
+    lastQuoteAt: string | null; lastFillAt: string | null
+  }
   trades: Array<{
     id: string; timestamp: string; symbol: string; clientSide: Side; size: number; clientPrice: number;
     hedgePrice: number; spreadPnl: number; clientFee: number; hedgeCost: number; netPnl: number;
@@ -125,7 +129,7 @@ export interface SystemState {
   config: {
     symbol: string; spreadBps: number; bittradeMakerFeeBps: number; gmoFeeBps: number; gmoMakerFeeBps: number;
     expectedPassiveFillRatio: number; gmoPostOnlyTimeoutMs: number; maxHedgeSlippageBps: number;
-    expectedSlippageBps: number; queueBudget: number; maxQuoteSize: number; deltaLimit: number;
+    expectedSlippageBps: number; queueBudgetJpy: number; maxQuoteSize: number; deltaLimit: number;
     maxHedgeLatencyMs: number; staleMarketMs: number
   }
   connection: {

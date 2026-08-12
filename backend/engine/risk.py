@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from ..core import ensure_native_core_for_mode
 from .state_store import StateStore
+
+
+ARM_TTL_BY_MODE = {"online": 3_600, "live": 3_600, "paper": 86_400, "simulation": 0}
 
 
 class AlertNotifier(Protocol):
@@ -42,7 +46,7 @@ class RiskGate:
     def __init__(self, store: StateStore, limits: RiskLimits | None = None, *,
                  confirmation_phrase: str | None = None, kill_sentinel: Path | str | None = None,
                  require_dual_approval: bool = False, approval_ttl_sec: int = 300,
-                 notifier: AlertNotifier | None = None):
+                 notifier: AlertNotifier | None = None, mode: str = "paper"):
         self.store = store
         self.limits = limits or RiskLimits()
         self.confirmation_phrase = confirmation_phrase if confirmation_phrase is not None else os.getenv("ARM_CONFIRMATION_PHRASE", "")
@@ -50,9 +54,11 @@ class RiskGate:
         self.require_dual_approval = require_dual_approval
         self.approval_ttl_sec = approval_ttl_sec
         self.notifier = notifier
+        self.mode = mode
         self.pending_arm_actor: str | None = None
         self.pending_arm_until = 0.0
         self.armed_until = 0.0
+        self._arm_active = False
         self.recovery_complete = False
         self.killed = False
         self.last_reason: str | None = None
@@ -60,11 +66,14 @@ class RiskGate:
 
     @property
     def armed(self) -> bool:
-        return not self.killed and self.recovery_complete and time.time() < self.armed_until
+        if self.killed or not self.recovery_complete or not self._arm_active:
+            return False
+        return self.armed_until == 0 or time.time() < self.armed_until
 
     async def restore(self) -> None:
         state = await self.store.get_state("risk", {})
         self.armed_until = 0.0  # restart always returns to DISARMED
+        self._arm_active = False
         self.killed = bool(state.get("killed", False)) or self.kill_sentinel.exists()
         self.recovery_complete = False
         self.last_reason = "startup reconciliation required"
@@ -78,6 +87,7 @@ class RiskGate:
 
     async def arm(self, phrase: str, actor: str) -> bool:
         async with self._lock:
+            ensure_native_core_for_mode(self.mode)
             if not self.confirmation_phrase:
                 await self.store.audit(
                     "risk.arm.denied", "warning", "arm confirmation phrase is not configured", actor=actor,
@@ -110,7 +120,8 @@ class RiskGate:
                     "risk.arm.dual_approved", "critical",
                     f"dual approval completed by {first_actor} and {actor}", actor=actor,
                 )
-            self.armed_until = time.time() + self.limits.arm_ttl_sec
+            self.armed_until = 0.0 if self.limits.arm_ttl_sec == 0 else time.time() + self.limits.arm_ttl_sec
+            self._arm_active = True
             self.last_reason = None
             await self._persist("armed", actor)
             return True
@@ -118,6 +129,7 @@ class RiskGate:
     async def disarm(self, reason: str, actor: str = "system") -> None:
         async with self._lock:
             self.armed_until = 0.0
+            self._arm_active = False
             self.pending_arm_actor = None
             self.pending_arm_until = 0.0
             self.last_reason = reason
@@ -135,6 +147,7 @@ class RiskGate:
         async with self._lock:
             self.killed = True
             self.armed_until = 0.0
+            self._arm_active = False
             self.pending_arm_actor = None
             self.pending_arm_until = 0.0
             self.last_reason = reason
@@ -146,6 +159,7 @@ class RiskGate:
                 raise ValueError(f"外部 kill 哨兵仍存在：{self.kill_sentinel}")
             self.killed = False
             self.armed_until = 0.0
+            self._arm_active = False
             self.pending_arm_actor = None
             self.pending_arm_until = 0.0
             self.recovery_complete = False
@@ -153,7 +167,7 @@ class RiskGate:
             await self._persist("kill reset", actor)
 
     async def evaluate(self, snapshot: RiskSnapshot, *, enforce: bool = True) -> tuple[bool, str | None]:
-        if self.armed_until > 0 and time.time() >= self.armed_until:
+        if self._arm_active and self.armed_until > 0 and time.time() >= self.armed_until:
             await self.disarm("arm expired")
         if self.kill_sentinel.exists() and not self.killed:
             await self.kill("external kill sentinel detected")
@@ -178,6 +192,7 @@ class RiskGate:
     async def _persist(self, message: str, actor: str = "system", level: str = "warning") -> None:
         await self.store.set_state("risk", {
             "armedUntil": self.armed_until, "killed": self.killed,
+            "armed": self._arm_active,
             "recoveryComplete": self.recovery_complete, "reason": self.last_reason,
             "pendingArmActor": self.pending_arm_actor,
             "pendingArmUntil": self.pending_arm_until,

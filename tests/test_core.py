@@ -15,6 +15,12 @@ def config(**updates) -> StrategyConfig:
     return StrategyConfig(**updates)
 
 
+def test_quote_defaults_restore_live_candidates_and_use_jpy_queue_budget():
+    defaults = StrategyConfig()
+    assert defaults.spreadBps == 12
+    assert defaults.queueBudgetJpy == 1_500_000
+
+
 def test_quotes_are_outside_gmo_and_depth_capped():
     market = MarketTop(symbol="BTC_JPY", bid=14_990_000, ask=15_010_000, bidSize=.02, askSize=.4, timestamp="", source="GMO")
     quotes = make_quotes(market, config(spreadBps=10))
@@ -122,3 +128,9 @@ def test_rust_and_decimal_fallback_outputs_are_consistent():
     assert native.reconcile(rows, [("SELL", .050000005)]) == pytest.approx(
         core_fallback.reconcile(rows, [("SELL", .050000005)]), abs=1e-12,
     )
+    for side in ("BUY", "SELL"):
+        assert native.hedge_side(side) == core_fallback.hedge_side(side)
+    for args in ((12, 5, 3), (25.5, -1, 4.25)):
+        assert native.validate_profitability(*args) == pytest.approx(
+            core_fallback.validate_profitability(*args), abs=1e-12,
+        )

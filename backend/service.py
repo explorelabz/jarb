@@ -14,7 +14,7 @@ import httpx
 from .adapters import BitTradeAdapter, GmoAdapter
 from .audit_store import AuditStore
 from .config import Credentials
-from .core import NATIVE_CORE_AVAILABLE, core_runtime, make_quotes, matched_trade, reconcile, validate_config
+from .core import core_runtime, ensure_native_core_for_mode, make_quotes, matched_trade, reconcile, validate_config
 from .engine.balance import BalanceCache
 from .engine.alerting import LarkWebhookNotifier
 from .engine.domain import EventType, FillDelta, HedgePreconditionError
@@ -30,7 +30,7 @@ from .engine.paper_matcher import (
 from .engine.quote_engine import QuoteEngine, WorkingQuote, target_price
 from .engine.rate_limit import EndpointGroup, Priority, PriorityRateLimiter
 from .engine.recovery import RecoveryCoordinator
-from .engine.risk import RiskGate, RiskLimits, RiskSnapshot
+from .engine.risk import ARM_TTL_BY_MODE, RiskGate, RiskLimits, RiskSnapshot
 from .engine.state_store import StateStore
 from .models import (
     AssetHolding, AuditEvent, ClientFill, ConnectionState, ConnectionUpdate, HedgeFill, HoldingsState,
@@ -40,9 +40,6 @@ from .models import (
 )
 
 
-# The public API accepts legacy online/simulation names, but service instances are
-# canonicalized to live/paper before this mapping is consumed.
-ARM_TTL_BY_MODE = {"live": 3_600, "online": 3_600, "paper": 86_400, "simulation": 0}
 HEARTBEAT_INTERVAL_SEC = 600
 ARM_EXPIRY_WARNING_SEC = 300
 MARKET_WATCHDOG_INTERVAL_SEC = 2.0
@@ -68,7 +65,8 @@ class TradingService:
                  market_gmo: GmoAdapter | None = None,
                  market_bittrade: BitTradeAdapter | None = None,
                  bittrade_depth_factory: Callable[[list[str]], BitTradeDepthFeed] | None = None,
-                 paper_trade_stream_factory: Callable[[list[str]], AsyncIterator[PublicTrade]] | None = None):
+                 paper_trade_stream_factory: Callable[[list[str]], AsyncIterator[PublicTrade]] | None = None,
+                 activity_alert_sec: float = 600):
         mode = {"simulation": "paper", "online": "live"}.get(mode, mode)
         if mode not in {"paper", "live"}:
             raise ValueError("mode must be paper or live")
@@ -109,6 +107,7 @@ class TradingService:
             confirmation_phrase="ARM JARB PAPER" if mode == "paper" else None,
             require_dual_approval=False if mode == "paper" else require_dual_arm_approval,
             notifier=self.notifier,
+            mode=mode,
         )
         self.lock = asyncio.Lock()
         self.subscribers: set[asyncio.Queue[str]] = set()
@@ -188,6 +187,11 @@ class TradingService:
         self._paper_risk_would_reject = 0
         self._paper_risk_reasons: dict[str, int] = {}
         self._paper_risk_current_reason: str | None = None
+        self.activity_alert_sec = max(0.0, float(activity_alert_sec))
+        self._no_quote_since: float | None = None
+        self._no_fill_since: float | None = None
+        self._no_quote_alerted = False
+        self._no_fill_alerted = False
         self._projection_symbols: set[str] = set()
         self._projection_task: asyncio.Task | None = None
         instrument = InstrumentRules(symbol=config.symbol, baseAsset=base_asset, minOrderSize=.0001,
@@ -670,6 +674,7 @@ class TradingService:
                     self._sync_primary()
                 await self._enforce_risk()
                 await self._run_live_quotes()
+                await self._check_activity_alerts()
                 self._publish()
         finally:
             self.events.close_queue(EventType.MARKET, queue)
@@ -985,12 +990,14 @@ class TradingService:
         self._sync_primary()
 
     async def arm(self, phrase: str, actor: str) -> dict:
-        if self.places_real_orders and not NATIVE_CORE_AVAILABLE:
+        try:
+            ensure_native_core_for_mode(self.state.mode)
+        except ValueError:
             await self.state_store.audit(
                 "risk.arm.denied", "critical",
                 "live Arm requires the Rust/PyO3 hedge core", actor=actor,
             )
-            raise ValueError("Live 模式缺少 Rust/PyO3 核心，禁止 Arm")
+            raise
         pending_submissions = await self.state_store.pending_hedge_submissions()
         if pending_submissions:
             raise ValueError(
@@ -1416,12 +1423,13 @@ class TradingService:
                 book_levels = bittrade_bids if quote.side == "BUY" else bittrade_asks
                 selected_price = target_price(
                     book_levels, gmo_hedge_price, required_edge,
-                    Decimal(str(runtime.config.queueBudget)),
+                    Decimal(str(runtime.config.queueBudgetJpy)),
                     Decimal(str(runtime.instrument.priceTick)), quote.side,
                     opposite_best=bittrade_best_bid if quote.side == "SELL" else bittrade_best_ask,
                 )
                 current = open_by_key.get(key)
                 if selected_price is None:
+                    self.state.metrics.quoteSelectionNoneCount += 1
                     if current:
                         await self.execution_gateway.cancel(current)
                         open_by_key.pop(key, None)
@@ -1519,8 +1527,70 @@ class TradingService:
         return self.bittrade_depth_feed.book(symbol)
 
     async def _on_live_maker_fill(self, fill: FillDelta) -> None:
+        self._no_fill_since = time.monotonic()
+        self._no_fill_alerted = False
+        self.state.metrics.lastFillAt = fill.occurred_at or utc_now()
+        self.state.metrics.noFillDurationSec = 0
         await self._apply_local_maker_balance(fill)
         self._schedule_projection(fill.symbol)
+
+    async def _check_activity_alerts(self) -> None:
+        """Expose quote/fill droughts and notify once per continuous incident."""
+        metrics = self.state.metrics
+        if not self.risk_gate.armed or not self.state.running:
+            self._no_quote_since = None
+            self._no_fill_since = None
+            self._no_quote_alerted = False
+            self._no_fill_alerted = False
+            metrics.noQuoteDurationSec = 0
+            metrics.noFillDurationSec = 0
+            return
+
+        now = time.monotonic()
+        working_orders = [
+            row for row in await self.state_store.open_orders()
+            if row["state"] in ("OPEN", "PARTIAL")
+        ]
+        if working_orders:
+            self._no_quote_since = None
+            self._no_quote_alerted = False
+            metrics.noQuoteDurationSec = 0
+            metrics.lastQuoteAt = utc_now()
+        else:
+            self._no_quote_since = self._no_quote_since or now
+            metrics.noQuoteDurationSec = max(0, int(now - self._no_quote_since))
+            if metrics.noQuoteDurationSec >= self.activity_alert_sec and not self._no_quote_alerted:
+                self._no_quote_alerted = await self._send_activity_alert(
+                    "zero-quotes",
+                    f"⚠️ JARB 连续 {metrics.noQuoteDurationSec // 60} 分钟零挂单；"
+                    f"selected_price=None 累计 {metrics.quoteSelectionNoneCount} 次。",
+                )
+
+        self._no_fill_since = self._no_fill_since or now
+        metrics.noFillDurationSec = max(0, int(now - self._no_fill_since))
+        if (
+            working_orders and metrics.noFillDurationSec >= self.activity_alert_sec
+            and not self._no_fill_alerted
+        ):
+            self._no_fill_alerted = await self._send_activity_alert(
+                "zero-fills",
+                f"⚠️ JARB 有 {len(working_orders)} 笔挂单，但已连续 "
+                f"{metrics.noFillDurationSec // 60} 分钟零成交。",
+            )
+
+    async def _send_activity_alert(self, key: str, message: str) -> bool:
+        try:
+            sent = await self.notifier.send_once(f"activity:{key}", message)
+            if sent:
+                await self._record("warning", f"activity.{key}", message)
+            return sent
+        except Exception as exc:
+            if self._engine_ready:
+                await self.state_store.audit(
+                    "alert.webhook.failed", "warning",
+                    f"{key} activity alert: {self._safe_error(exc)}",
+                )
+            return False
 
     async def _on_live_hedge_execution(self, symbol: str, side: str,
                                         execution: HedgeExecution) -> None:

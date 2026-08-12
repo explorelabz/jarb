@@ -197,6 +197,39 @@ async def test_risk_gate_requires_recovery_and_expires(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_simulation_arm_with_zero_ttl_does_not_expire(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    risk = RiskGate(
+        store, RiskLimits(arm_ttl_sec=0), confirmation_phrase="ARM",
+        kill_sentinel=tmp_path / "KILL", mode="simulation",
+    )
+    await risk.restore()
+    await risk.mark_recovery_complete()
+    await risk.arm("ARM", "tester")
+    assert risk.armed_until == 0
+    monkeypatch.setattr("backend.engine.risk.time.time", lambda: 10**12)
+    assert risk.armed
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_risk_gate_itself_blocks_live_arm_without_rust(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state.db")
+    await store.initialize()
+    risk = RiskGate(
+        store, confirmation_phrase="ARM", kill_sentinel=tmp_path / "KILL", mode="online",
+    )
+    await risk.restore()
+    await risk.mark_recovery_complete()
+    monkeypatch.setattr("backend.core.NATIVE_CORE_AVAILABLE", False)
+    with pytest.raises(ValueError, match="Rust 核心未安装，禁止实盘 Arm"):
+        await risk.arm("ARM", "tester")
+    assert not risk.armed
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_risk_disarm_sends_lark_alert_without_blocking_safety(tmp_path):
     class CaptureNotifier:
         messages: list[tuple[str, str]] = []
@@ -255,11 +288,11 @@ def test_default_requote_policy_preserves_queue_and_depth_aware_price_steps_insi
     assert policy.min_remaining_ratio == Decimal("0.25")
     sell = target_price(
         [(Decimal("101"), Decimal(".01")), (Decimal("102"), Decimal(".01"))],
-        Decimal("100"), Decimal("100"), Decimal(".05"), Decimal("1"), "SELL",
+        Decimal("100"), Decimal("100"), Decimal("5"), Decimal("1"), "SELL",
     )
     buy = target_price(
         [(Decimal("99"), Decimal(".01")), (Decimal("98"), Decimal(".01"))],
-        Decimal("100"), Decimal("100"), Decimal(".05"), Decimal("1"), "BUY",
+        Decimal("100"), Decimal("100"), Decimal("5"), Decimal("1"), "BUY",
     )
     assert sell == Decimal("101")
     assert buy == Decimal("99")
@@ -273,6 +306,19 @@ def test_target_price_never_joins_or_crosses_the_opposite_best():
     assert target_price(
         [(Decimal("99"), Decimal("1"))], Decimal("100"), Decimal("0"),
         Decimal("1"), Decimal("1"), "BUY", opposite_best=Decimal("100"),
+    ) is None
+
+
+def test_target_price_converts_jpy_budget_at_each_candidate_price():
+    levels = [
+        (Decimal("101"), Decimal("1")),
+        (Decimal("102"), Decimal("1")),
+    ]
+    assert target_price(
+        levels, Decimal("100"), Decimal("200"), Decimal("102"), Decimal("1"), "SELL",
+    ) == Decimal("102")
+    assert target_price(
+        levels, Decimal("100"), Decimal("200"), Decimal("101"), Decimal("1"), "SELL",
     ) is None
 
 
@@ -841,6 +887,10 @@ async def test_process_exit_after_fak_acceptance_leaves_durable_recovery_barrier
     )
     await worker.start()
     assert adapter.market_orders == 0
+    recovered_intent = await store.hedge_intent(submissions[0].intent_ids[0])
+    assert recovered_intent is not None
+    assert recovered_intent.filled_qty == Decimal("0.1")
+    assert recovered_intent.status == HedgeStatus.HEDGED
     assert not await store.pending_hedge_submissions()
     assert not await store.pending_hedges()
     await worker.stop()
